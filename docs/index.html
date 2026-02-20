@@ -3,38 +3,128 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Speak TTS - Model Comparison Samples</title>
+<title>Speak TTS - Voice Gallery</title>
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; color: #e0e0e0; background: #1a1a2e; }
   h1 { border-bottom: 2px solid #444; padding-bottom: 0.5rem; }
-  h2 { margin-top: 2rem; color: #a0c4ff; }
-  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  h2 { margin-top: 2.5rem; color: #a0c4ff; }
+  h3 { margin-top: 1.5rem; color: #c4a0ff; font-size: 1rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  table { width: 100%; border-collapse: collapse; margin: 0.5rem 0 1.5rem; }
   th, td { padding: 0.6rem; text-align: left; border-bottom: 1px solid #333; }
   th { color: #a0c4ff; font-size: 0.85rem; text-transform: uppercase; }
   td:first-child { font-weight: 600; white-space: nowrap; }
   audio { width: 100%; height: 36px; }
+  .voice-id { font-family: monospace; font-size: 0.85rem; color: #888; }
   .label { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }
+  .af { background: #2d3a4a; color: #a0c4ff; }
+  .am { background: #2d4a3a; color: #8fbca0; }
+  .bf { background: #4a2d3a; color: #c4a0c4; }
+  .bm { background: #4a3a2d; color: #c4b08f; }
   .f32 { background: #2d4a22; color: #8fbc8f; }
   .fp16 { background: #4a3f22; color: #daa520; }
   .int8 { background: #4a2222; color: #cd5c5c; }
   .stats { color: #888; font-size: 0.85rem; }
   a { color: #6fa8dc; }
   .note { background: #222; padding: 1rem; border-radius: 8px; margin: 1rem 0; font-size: 0.9rem; color: #aaa; }
+  .quote { font-style: italic; color: #999; margin: 0.5rem 0 1rem; }
+  details { margin-top: 2rem; }
+  summary { cursor: pointer; color: #a0c4ff; font-size: 1.1rem; font-weight: 600; }
+  summary:hover { color: #c4d4ff; }
 </style>
 </head>
 <body>
 
-<h1>Speak TTS - Model Comparison</h1>
-<p>Audio samples generated with <a href="https://github.com/thewh1teagle/kokoro-onnx">Kokoro ONNX</a> v1.0 on Apple Silicon (M-series Mac).</p>
+<h1>Speak TTS - Voice Gallery</h1>
+<p>54 voices available via <a href="https://github.com/thewh1teagle/kokoro-onnx">Kokoro ONNX</a> v1.0, running locally on Apple Silicon. All samples below use the <span class="label fp16">fp16</span> model (169MB, fastest on ARM).</p>
 
 <div class="note">
-  <strong>Comparing three model variants:</strong><br>
-  <span class="label f32">f32</span> Full precision (310MB) - baseline quality<br>
-  <span class="label fp16">fp16</span> Half precision (169MB) - 1.3x faster, half the size<br>
-  <span class="label int8">int8</span> 8-bit quantized (88MB) - smallest, but 2x slower on ARM
+  Voice naming: <code>af_</code> = American Female, <code>am_</code> = American Male, <code>bf_</code> = British Female, <code>bm_</code> = British Male
 </div>
 
-<h2>Short Text</h2>
+<p class="quote">"The sunset painted the sky in shades of gold and crimson, as a gentle breeze carried the scent of jasmine through the open window."</p>
+
+<h3>American Female</h3>
+<table>
+  <tr><th>Voice</th><th>Audio</th></tr>
+  <tr>
+    <td><span class="label af">Heart</span> <span class="voice-id">af_heart</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/af_heart.wav" type="audio/wav"></audio></td>
+  </tr>
+  <tr>
+    <td><span class="label af">Bella</span> <span class="voice-id">af_bella</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/af_bella.wav" type="audio/wav"></audio></td>
+  </tr>
+  <tr>
+    <td><span class="label af">Nova</span> <span class="voice-id">af_nova</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/af_nova.wav" type="audio/wav"></audio></td>
+  </tr>
+  <tr>
+    <td><span class="label af">River</span> <span class="voice-id">af_river</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/af_river.wav" type="audio/wav"></audio></td>
+  </tr>
+  <tr>
+    <td><span class="label af">Sky</span> <span class="voice-id">af_sky</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/af_sky.wav" type="audio/wav"></audio></td>
+  </tr>
+</table>
+
+<h3>American Male</h3>
+<table>
+  <tr><th>Voice</th><th>Audio</th></tr>
+  <tr>
+    <td><span class="label am">Adam</span> <span class="voice-id">am_adam</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/am_adam.wav" type="audio/wav"></audio></td>
+  </tr>
+  <tr>
+    <td><span class="label am">Echo</span> <span class="voice-id">am_echo</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/am_echo.wav" type="audio/wav"></audio></td>
+  </tr>
+  <tr>
+    <td><span class="label am">Michael</span> <span class="voice-id">am_michael</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/am_michael.wav" type="audio/wav"></audio></td>
+  </tr>
+  <tr>
+    <td><span class="label am">Puck</span> <span class="voice-id">am_puck</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/am_puck.wav" type="audio/wav"></audio></td>
+  </tr>
+</table>
+
+<h3>British Female</h3>
+<table>
+  <tr><th>Voice</th><th>Audio</th></tr>
+  <tr>
+    <td><span class="label bf">Emma</span> <span class="voice-id">bf_emma</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/bf_emma.wav" type="audio/wav"></audio></td>
+  </tr>
+  <tr>
+    <td><span class="label bf">Isabella</span> <span class="voice-id">bf_isabella</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/bf_isabella.wav" type="audio/wav"></audio></td>
+  </tr>
+</table>
+
+<h3>British Male</h3>
+<table>
+  <tr><th>Voice</th><th>Audio</th></tr>
+  <tr>
+    <td><span class="label bm">George</span> <span class="voice-id">bm_george</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/bm_george.wav" type="audio/wav"></audio></td>
+  </tr>
+  <tr>
+    <td><span class="label bm">Daniel</span> <span class="voice-id">bm_daniel</span></td>
+    <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/voices/bm_daniel.wav" type="audio/wav"></audio></td>
+  </tr>
+</table>
+
+<details>
+<summary>Model Comparison (f32 vs fp16 vs int8)</summary>
+
+<div class="note" style="margin-top: 1rem;">
+  <span class="label f32">f32</span> Full precision (310MB) — baseline<br>
+  <span class="label fp16">fp16</span> Half precision (169MB) — 1.3x faster, identical quality<br>
+  <span class="label int8">int8</span> 8-bit quantized (88MB) — 2x slower on ARM, no audible benefit
+</div>
+
+<h3>Short Text</h3>
 <p class="stats">"Hello, this is a quick test of Kokoro text to speech."</p>
 <table>
   <tr><th>Model</th><th>Inference</th><th>Audio</th></tr>
@@ -55,7 +145,7 @@
   </tr>
 </table>
 
-<h2>Medium Text</h2>
+<h3>Medium Text</h3>
 <p class="stats">"The quick brown fox jumps over the lazy dog. This is a classic pangram that contains every letter of the English alphabet at least once."</p>
 <table>
   <tr><th>Model</th><th>Inference</th><th>Audio</th></tr>
@@ -76,7 +166,7 @@
   </tr>
 </table>
 
-<h2>Long Text</h2>
+<h3>Long Text</h3>
 <p class="stats">"In the beginning, the universe was created. This has made a lot of people very angry and been widely regarded as a bad move..."</p>
 <table>
   <tr><th>Model</th><th>Inference</th><th>Audio</th></tr>
@@ -96,9 +186,10 @@
     <td><audio controls preload="none"><source src="https://github.com/trillium/speak/raw/main/samples/int8_long.wav" type="audio/wav"></audio></td>
   </tr>
 </table>
+</details>
 
 <hr style="border-color: #333; margin-top: 2rem;">
-<p class="stats">Generated by <a href="https://github.com/trillium/speak">speak</a> using voice <code>af_heart</code> at 1.0x speed, 24kHz sample rate.</p>
+<p class="stats">Generated by <a href="https://github.com/trillium/speak">speak</a> at 1.0x speed, 24kHz sample rate. 54 voices available — <a href="https://github.com/trillium/speak#usage">see all</a>.</p>
 
 </body>
 </html>
