@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Speak daemon — keeps Kokoro model loaded, serves TTS over Unix socket."""
+"""Speak daemon — keeps Kokoro model loaded, serves TTS over Unix socket.
+
+Streams audio at sentence granularity: the first sentence starts playing
+while subsequent sentences are still being synthesized.
+"""
 
 import asyncio
 import json
 import os
+import re
 import signal
 import struct
 import sys
@@ -12,8 +17,33 @@ import time
 import numpy as np
 from kokoro_onnx import Kokoro
 
+# Fix kokoro-onnx bug: speed dtype is np.int32 instead of np.float32
+# for models using input_ids format (v1.0 models)
+_orig_create_audio = Kokoro._create_audio
+def _fixed_create_audio(self, phonemes, voice, speed):
+    orig_run = self.sess.run
+    def patched_run(output_names, inputs, *args, **kwargs):
+        if "speed" in inputs and hasattr(inputs["speed"], "dtype"):
+            inputs["speed"] = np.array(inputs["speed"], dtype=np.float32)
+        return orig_run(output_names, inputs, *args, **kwargs)
+    self.sess.run = patched_run
+    try:
+        return _orig_create_audio(self, phonemes, voice, speed)
+    finally:
+        self.sess.run = orig_run
+Kokoro._create_audio = _fixed_create_audio
+
+# Split on any natural pause: sentence endings, commas, semicolons, colons, dashes
+_CLAUSE_RE = re.compile(r'(?<=[.!?,;:\u2014—-])\s+')
+
 SOCKET_PATH = f"/tmp/speak-{os.environ['USER']}.sock"
 IDLE_TIMEOUT = 300  # shut down after 5 minutes idle
+
+
+def split_clauses(text: str) -> list[str]:
+    """Split text into clauses at any natural pause point for streaming."""
+    parts = _CLAUSE_RE.split(text.strip())
+    return [s.strip() for s in parts if s.strip()]
 
 
 class SpeakDaemon:
@@ -21,6 +51,15 @@ class SpeakDaemon:
         self.kokoro = Kokoro(model_path, voices_path)
         self.last_activity = time.monotonic()
         self.active_connections = 0
+
+    def _synthesize_sentence(self, sentence, voice, speed):
+        """Synthesize a single sentence (blocking, runs in executor)."""
+        audio, sample_rate = self.kokoro._create_audio(
+            self.kokoro.tokenizer.phonemize(sentence, "en-us"),
+            voice,
+            speed,
+        )
+        return (audio * 32767).astype(np.int16).tobytes()
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.active_connections += 1
@@ -33,7 +72,7 @@ class SpeakDaemon:
             request = json.loads(raw_msg.decode())
 
             text = request.get("text", "").strip()
-            voice = request.get("voice", "af_heart")
+            voice_name = request.get("voice", "af_heart")
             speed = request.get("speed", 1.0)
             lang = request.get("lang", "en-us")
 
@@ -42,12 +81,17 @@ class SpeakDaemon:
                 await writer.wait_closed()
                 return
 
-            # Stream audio chunks back to client
-            async for samples, sample_rate in self.kokoro.create_stream(
-                text, voice=voice, speed=speed, lang=lang
-            ):
-                pcm = (samples * 32767).astype(np.int16).tobytes()
-                # Send length-prefixed chunk
+            # Resolve voice style vector once
+            voice = self.kokoro.get_voice_style(voice_name)
+
+            # Split into clauses and stream each one as it's ready
+            clauses = split_clauses(text)
+            loop = asyncio.get_event_loop()
+
+            for sentence in clauses:
+                pcm = await loop.run_in_executor(
+                    None, self._synthesize_sentence, sentence, voice, speed
+                )
                 writer.write(struct.pack("!I", len(pcm)))
                 writer.write(pcm)
                 await writer.drain()

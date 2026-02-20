@@ -49,7 +49,7 @@ EOF
 # --- Dependency checks ---
 missing=()
 command -v uv    >/dev/null 2>&1 || missing+=(uv)
-command -v aplay >/dev/null 2>&1 || missing+=(aplay)
+command -v play >/dev/null 2>&1 || missing+=(sox)
 
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "speak: missing required tools: ${missing[*]}" >&2
@@ -76,7 +76,7 @@ start_daemon() {
     fi
 
     echo "speak: starting daemon..." >&2
-    uv run --with kokoro-onnx -- \
+    uv run --python 3.14 --with kokoro-onnx -- \
         python3 "${SCRIPT_DIR}/speak-daemon" \
             --model "${model}" --voices "${voices}" &
     disown
@@ -159,13 +159,13 @@ fi
 if [[ "${LIST_VOICES}" == true ]]; then
     case "${ENGINE}" in
         kokoro)
-            uv run --with kokoro-tts -- kokoro-tts \
+            uv run --python 3.14 --with kokoro-tts -- kokoro-tts \
                 --model "${KOKORO_DIR}/kokoro-v1.0.onnx" \
                 --voices "${KOKORO_DIR}/voices-v1.0.bin" \
                 --help-voices 2>&1 | grep -v "^Consider"
             ;;
         piper)
-            uv run --with piper-tts --with pathvalidate -- \
+            uv run --python 3.14 --with piper-tts --with pathvalidate -- \
                 python3 -m piper.download_voices 2>&1 | grep "^en_"
             ;;
     esac
@@ -205,15 +205,15 @@ speak_kokoro() {
         # For --save, use kokoro-tts CLI directly (produces proper WAV headers)
         local model="${KOKORO_DIR}/kokoro-v1.0.onnx"
         local voices="${KOKORO_DIR}/voices-v1.0.bin"
-        printf '%s' "${TEXT}" | uv run --with kokoro-tts -- kokoro-tts - "${SAVE_FILE}" \
+        printf '%s' "${TEXT}" | uv run --python 3.14 --with kokoro-tts -- kokoro-tts - "${SAVE_FILE}" \
             --voice "${VOICE}" --speed "${SPEED}" \
             --model "${model}" --voices "${voices}" 2>&1 | grep -v "^Consider"
         echo "speak: saved to ${SAVE_FILE}" >&2
     else
-        # Stream via daemon -> speak-client -> aplay
+        # Stream via daemon -> speak-client -> play (sox)
         printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
                 --voice "${VOICE}" --speed "${SPEED}" \
-        | aplay -r 24000 -f S16_LE -c 1 -t raw -q
+        | play -r 24000 -b 16 -e signed -c 1 -t raw -
     fi
 }
 
@@ -227,11 +227,11 @@ speak_kokoro_direct() {
         exit 1
     fi
 
-    printf '%s' "${TEXT}" | uv run --with kokoro-onnx -- \
+    printf '%s' "${TEXT}" | uv run --python 3.14 --with kokoro-onnx -- \
         python3 "${SCRIPT_DIR}/kokoro-stream" \
             --model "${model}" --voices "${voices}" \
             --voice "${VOICE}" --speed "${SPEED}" \
-    | aplay -r 24000 -f S16_LE -c 1 -t raw -q
+    | play -r 24000 -b 16 -e signed -c 1 -t raw -
 }
 
 # =============================================================================
@@ -247,7 +247,7 @@ speak_piper() {
     if [[ ! -f "${model}" ]]; then
         echo "speak: downloading piper voice '${VOICE}'..." >&2
         mkdir -p "${PIPER_VOICES_DIR}"
-        uv run --with piper-tts --with pathvalidate -- \
+        uv run --python 3.14 --with piper-tts --with pathvalidate -- \
             python3 -m piper.download_voices --download-dir "${PIPER_VOICES_DIR}" "${VOICE}"
         if [[ ! -f "${model}" ]]; then
             echo "speak: failed to download voice '${VOICE}'" >&2
@@ -268,17 +268,17 @@ speak_piper() {
     fi
 
     if [[ -n "${SAVE_FILE}" ]]; then
-        printf '%s' "${TEXT}" | uv run --with piper-tts --with pathvalidate -- \
+        printf '%s' "${TEXT}" | uv run --python 3.14 --with piper-tts --with pathvalidate -- \
             piper -m "${model}" -c "${config}" \
                   --length-scale "${SPEED}" \
                   --output_file "${SAVE_FILE}"
         echo "speak: saved to ${SAVE_FILE}" >&2
     else
-        printf '%s' "${TEXT}" | uv run --with piper-tts --with pathvalidate -- \
+        printf '%s' "${TEXT}" | uv run --python 3.14 --with piper-tts --with pathvalidate -- \
             piper -m "${model}" -c "${config}" \
                   --length-scale "${SPEED}" \
                   --output-raw \
-        | aplay -r "${sample_rate}" -f S16_LE -c 1 -t raw -q
+        | play -r "${sample_rate}" -b 16 -e signed -c 1 -t raw -
     fi
 }
 
