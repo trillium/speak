@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Speak daemon — keeps Kokoro model loaded, serves TTS over Unix socket."""
+
+import asyncio
+import json
+import os
+import signal
+import struct
+import sys
+import time
+
+import numpy as np
+from kokoro_onnx import Kokoro
+
+SOCKET_PATH = f"/tmp/speak-{os.environ['USER']}.sock"
+IDLE_TIMEOUT = 300  # shut down after 5 minutes idle
+
+
+class SpeakDaemon:
+    def __init__(self, model_path: str, voices_path: str):
+        self.kokoro = Kokoro(model_path, voices_path)
+        self.last_activity = time.monotonic()
+        self.active_connections = 0
+
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.active_connections += 1
+        self.last_activity = time.monotonic()
+        try:
+            # Read length-prefixed JSON request
+            raw_len = await reader.readexactly(4)
+            msg_len = struct.unpack("!I", raw_len)[0]
+            raw_msg = await reader.readexactly(msg_len)
+            request = json.loads(raw_msg.decode())
+
+            text = request.get("text", "").strip()
+            voice = request.get("voice", "af_heart")
+            speed = request.get("speed", 1.0)
+            lang = request.get("lang", "en-us")
+
+            if not text:
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            # Stream audio chunks back to client
+            async for samples, sample_rate in self.kokoro.create_stream(
+                text, voice=voice, speed=speed, lang=lang
+            ):
+                pcm = (samples * 32767).astype(np.int16).tobytes()
+                # Send length-prefixed chunk
+                writer.write(struct.pack("!I", len(pcm)))
+                writer.write(pcm)
+                await writer.drain()
+
+            # Signal end of stream with zero-length chunk
+            writer.write(struct.pack("!I", 0))
+            await writer.drain()
+
+        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
+            pass
+        finally:
+            self.active_connections -= 1
+            self.last_activity = time.monotonic()
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def idle_watchdog(self):
+        """Shut down if idle for IDLE_TIMEOUT seconds."""
+        while True:
+            await asyncio.sleep(30)
+            idle_for = time.monotonic() - self.last_activity
+            if self.active_connections == 0 and idle_for >= IDLE_TIMEOUT:
+                print(f"speak-daemon: idle for {IDLE_TIMEOUT}s, shutting down", file=sys.stderr)
+                cleanup_and_exit()
+
+    async def run(self):
+        # Clean up stale socket
+        if os.path.exists(SOCKET_PATH):
+            os.unlink(SOCKET_PATH)
+
+        server = await asyncio.start_unix_server(self.handle_client, path=SOCKET_PATH)
+        os.chmod(SOCKET_PATH, 0o600)
+
+        # Write PID file for management
+        pid_path = SOCKET_PATH + ".pid"
+        with open(pid_path, "w") as f:
+            f.write(str(os.getpid()))
+
+        print(f"speak-daemon: listening on {SOCKET_PATH} (pid {os.getpid()})", file=sys.stderr)
+
+        asyncio.create_task(self.idle_watchdog())
+
+        async with server:
+            await server.serve_forever()
+
+
+def cleanup_and_exit():
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    try:
+        os.unlink(SOCKET_PATH + ".pid")
+    except FileNotFoundError:
+        pass
+    sys.exit(0)
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--voices", required=True)
+    args = parser.parse_args()
+
+    # Handle signals for clean shutdown
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: cleanup_and_exit())
+
+    print("speak-daemon: loading model...", file=sys.stderr)
+    daemon = SpeakDaemon(args.model, args.voices)
+    print("speak-daemon: model loaded, ready.", file=sys.stderr)
+
+    asyncio.run(daemon.run())
+
+
+if __name__ == "__main__":
+    main()

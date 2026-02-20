@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Connect to speak-daemon, send text, stream raw PCM to stdout."""
+
+import json
+import os
+import socket
+import struct
+import sys
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--voice", default="af_heart")
+    parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--lang", default="en-us")
+    args = parser.parse_args()
+
+    text = sys.stdin.read().strip()
+    if not text:
+        return
+
+    sock_path = f"/tmp/speak-{os.environ['USER']}.sock"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(sock_path)
+
+    # Send length-prefixed JSON request
+    request = json.dumps({
+        "text": text,
+        "voice": args.voice,
+        "speed": args.speed,
+        "lang": args.lang,
+    }).encode()
+    sock.sendall(struct.pack("!I", len(request)))
+    sock.sendall(request)
+
+    # Read length-prefixed PCM chunks and write to stdout
+    while True:
+        raw_len = _recvall(sock, 4)
+        if not raw_len:
+            break
+        chunk_len = struct.unpack("!I", raw_len)[0]
+        if chunk_len == 0:
+            break
+        pcm = _recvall(sock, chunk_len)
+        if not pcm:
+            break
+        sys.stdout.buffer.write(pcm)
+        sys.stdout.buffer.flush()
+
+    sock.close()
+
+
+def _recvall(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+if __name__ == "__main__":
+    main()
