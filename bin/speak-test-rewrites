@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Manage pronunciation and phrase rewrite review status.
+
+Subcommands:
+  list         Show all rewrites with review status
+  pending      Show only unreviewed entries
+  accept K     Mark entry as accepted
+  reject K     Mark entry as rejected
+  test K       Speak the before/after for an entry
+  test-all     Speak all unreviewed entries
+  review [F]   Re-speak entries by status (accepted/rejected/unnecessary/pending/all)
+  regenerate   Regenerate all rejected pronunciations via LLM
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "..", "config", "rewrites.json")
+REVIEW_PATH = os.path.join(SCRIPT_DIR, "..", "config", "rewrites-review.json")
+SPEAK = os.path.join(SCRIPT_DIR, "speak")
+
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def speak(text):
+    subprocess.run([SPEAK, "--enqueue", text], capture_output=True)
+
+
+def get_all_entries(config):
+    entries = []
+    for section in ("pronunciation", "phrase_rewrites"):
+        for key, value in config.get(section, {}).items():
+            entries.append((section, key, value))
+    return entries
+
+
+def review_key(section, word):
+    return f"{section}:{word}"
+
+
+def cmd_list(config, review):
+    entries = get_all_entries(config)
+    if not entries:
+        print("No rewrites configured.")
+        return
+
+    accepted = 0
+    rejected = 0
+    pending = 0
+
+    print(f"{'Status':<10} {'Section':<18} {'Key':<25} {'Value'}")
+    print("-" * 80)
+    for section, word, value in entries:
+        rk = review_key(section, word)
+        status = review.get(rk, {}).get("status", "pending")
+        if status == "accepted":
+            marker = "  ✓"
+            accepted += 1
+        elif status == "rejected":
+            marker = "  ✗"
+            rejected += 1
+        else:
+            marker = "  ?"
+            pending += 1
+        display_value = value if value else "(remove)"
+        print(f"{marker:<10} {section:<18} {word:<25} {display_value}")
+
+    print(f"\n{accepted} accepted, {rejected} rejected, {pending} pending")
+
+
+def is_pending(review, rk):
+    """Check if an entry is pending review (no entry or status is pending)."""
+    entry = review.get(rk)
+    return entry is None or entry.get("status") == "pending"
+
+
+def cmd_pending(config, review):
+    entries = get_all_entries(config)
+    pending = []
+    for section, word, value in entries:
+        rk = review_key(section, word)
+        if is_pending(review, rk):
+            pending.append((section, word, value))
+
+    if not pending:
+        print("All entries reviewed.")
+        return
+
+    print(f"{len(pending)} unreviewed entries:\n")
+    for section, word, value in pending:
+        display_value = value if value else "(remove)"
+        print(f"  [{section}] {word} → {display_value}")
+
+
+def cmd_accept(config, review, key):
+    found = find_entry(config, key)
+    if not found:
+        print(f"No rewrite found matching '{key}'")
+        sys.exit(1)
+    section, word, value = found
+    rk = review_key(section, word)
+    review[rk] = {
+        "word": word,
+        "value": value,
+        "section": section,
+        "status": "accepted",
+        "reviewed_at": time.time(),
+    }
+    save_json(REVIEW_PATH, review)
+    print(f"✓ Accepted: {word} → {value}")
+
+
+def cmd_reject(config, review, key):
+    found = find_entry(config, key)
+    if not found:
+        print(f"No rewrite found matching '{key}'")
+        sys.exit(1)
+    section, word, value = found
+    rk = review_key(section, word)
+    # Accumulate rejected alternatives
+    existing = review.get(rk, {})
+    rejected_alts = list(existing.get("rejected_alts", []))
+    if value and value not in rejected_alts:
+        rejected_alts.append(value)
+    review[rk] = {
+        "word": word,
+        "value": value,
+        "section": section,
+        "status": "rejected",
+        "reviewed_at": time.time(),
+        "rejected_alts": rejected_alts,
+    }
+    save_json(REVIEW_PATH, review)
+    print(f"✗ Rejected: {word} → {value}")
+
+
+def cmd_unnecessary(config, review, key):
+    found = find_entry(config, key)
+    if not found:
+        print(f"No rewrite found matching '{key}'")
+        sys.exit(1)
+    section, word, value = found
+    # Remove from rewrites.json
+    del config[section][word]
+    save_json(CONFIG_PATH, config)
+    # Mark in review as unnecessary
+    rk = review_key(section, word)
+    review[rk] = {
+        "word": word,
+        "value": value,
+        "section": section,
+        "status": "unnecessary",
+        "reviewed_at": time.time(),
+    }
+    save_json(REVIEW_PATH, review)
+    print(f"⊘ Unnecessary: {word} → {value} (removed from rewrites)")
+
+
+def cmd_fix(config, review, key, new_value):
+    found = find_entry(config, key)
+    if not found:
+        print(f"No rewrite found matching '{key}'")
+        sys.exit(1)
+    section, word, old_value = found
+    config[section][word] = new_value
+    save_json(CONFIG_PATH, config)
+    # Reset review status but preserve rejected_alts history
+    rk = review_key(section, word)
+    existing = review.get(rk, {})
+    rejected_alts = list(existing.get("rejected_alts", []))
+    review[rk] = {
+        "word": word,
+        "value": new_value,
+        "section": section,
+        "status": "pending",
+        "rejected_alts": rejected_alts,
+    }
+    save_json(REVIEW_PATH, review)
+    print(f"Fixed: {word} → {new_value}  (was: {old_value})")
+    if section == "pronunciation":
+        speak(f"{word} becomes {new_value}")
+    else:
+        if new_value:
+            speak(f"The phrase {word} will be replaced with {new_value}")
+        else:
+            speak(f"The phrase {word} will be removed")
+
+
+def cmd_test(config, key):
+    found = find_entry(config, key)
+    if not found:
+        print(f"No rewrite found matching '{key}'")
+        sys.exit(1)
+    section, word, value = found
+    if section == "pronunciation":
+        speak(f"{word} becomes {value}")
+    else:
+        if value:
+            speak(f"The phrase {word} will be replaced with {value}")
+        else:
+            speak(f"The phrase {word} will be removed")
+    print(f"Spoke: [{section}] {word} → {value}")
+
+
+def cmd_test_all(config, review):
+    entries = get_all_entries(config)
+    pending = []
+    for section, word, value in entries:
+        rk = review_key(section, word)
+        if is_pending(review, rk):
+            pending.append((section, word, value))
+
+    if not pending:
+        print("All entries already reviewed.")
+        return
+
+    print(f"Speaking {len(pending)} unreviewed entries...")
+    speak(f"Testing {len(pending)} entries")
+
+    for section, word, value in pending:
+        if section == "pronunciation":
+            speak(f"{word} becomes {value}")
+        else:
+            if value:
+                speak(f"The phrase {word} replaced with {value}")
+            else:
+                speak(f"The phrase {word} removed")
+
+
+VALID_FILTERS = ("accepted", "rejected", "unnecessary", "pending", "all")
+
+
+def cmd_review(config, review, status_filter):
+    """Re-speak entries by status so the user can re-evaluate past decisions."""
+    if status_filter not in VALID_FILTERS:
+        print(f"Unknown filter: {status_filter}")
+        print(f"Valid filters: {', '.join(VALID_FILTERS)}")
+        sys.exit(1)
+
+    entries = get_all_entries(config)
+    matched = []
+    for section, word, value in entries:
+        rk = review_key(section, word)
+        entry = review.get(rk)
+        status = entry.get("status", "pending") if entry else "pending"
+        if status_filter == "all" or status == status_filter:
+            matched.append((section, word, value, status))
+
+    # For unnecessary entries, they've been removed from config — check review directly
+    if status_filter in ("unnecessary", "all"):
+        for rk, entry in review.items():
+            if entry.get("status") != "unnecessary":
+                continue
+            # Skip if already found in config (shouldn't happen, but be safe)
+            word = entry["word"]
+            section = entry["section"]
+            value = entry["value"]
+            if not any(w == word and s == section for s, w, _, _ in matched):
+                matched.append((section, word, value, "unnecessary"))
+
+    if not matched:
+        print(f"No {status_filter} entries found.")
+        return
+
+    label = status_filter if status_filter != "all" else "total"
+    print(f"Reviewing {len(matched)} {label} entries...\n")
+    speak(f"Reviewing {len(matched)} {label} entries")
+
+    for section, word, value, status in matched:
+        status_marker = {"accepted": "✓", "rejected": "✗", "pending": "?", "unnecessary": "⊘"}.get(status, "?")
+        display_value = value if value else "(remove)"
+        print(f"  {status_marker} [{section}] {word} → {display_value}")
+
+        if section == "pronunciation":
+            speak(f"{word} becomes {value}")
+        else:
+            if value:
+                speak(f"The phrase {word} replaced with {value}")
+            else:
+                speak(f"The phrase {word} removed")
+
+    print(f"\nUse accept/reject/unnecessary/fix to change any entry.")
+
+
+def get_accepted_examples(config, review):
+    """Gather accepted pronunciation examples for LLM context."""
+    examples = {}
+    for word, value in config.get("pronunciation", {}).items():
+        rk = review_key("pronunciation", word)
+        entry = review.get(rk, {})
+        if entry.get("status") == "accepted":
+            examples[word] = value
+    return examples
+
+
+SPEAK_ALTS = os.path.join(SCRIPT_DIR, "speak-alts")
+
+
+def cmd_regenerate(config, review):
+    """Regenerate all rejected pronunciation entries via LLM.
+
+    For each rejected entry, calls speak-alts to get a new candidate,
+    updates rewrites.json with the first suggestion, and resets status
+    to pending for re-testing. The rejected_alts list is preserved
+    internally so the LLM avoids repeating failed attempts.
+    """
+    rejected = []
+    for word, value in config.get("pronunciation", {}).items():
+        rk = review_key("pronunciation", word)
+        entry = review.get(rk, {})
+        if entry.get("status") == "rejected":
+            rejected.append((word, value, entry))
+
+    if not rejected:
+        print("No rejected pronunciation entries to regenerate.")
+        return
+
+    accepted_examples = get_accepted_examples(config, review)
+    updated = 0
+
+    print(f"Regenerating {len(rejected)} rejected entries...")
+
+    for word, value, entry in rejected:
+        rejected_alts = list(entry.get("rejected_alts", []))
+        input_data = json.dumps({
+            "word": word,
+            "current_value": value,
+            "rejected_alts": rejected_alts,
+            "accepted_examples": accepted_examples,
+        })
+
+        try:
+            result = subprocess.run(
+                [SPEAK_ALTS],
+                input=input_data,
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            candidates = json.loads(result.stdout.strip())
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+            print(f"  ✗ {word}: LLM call failed, skipping")
+            continue
+
+        if not candidates:
+            print(f"  ✗ {word}: no candidates generated, skipping")
+            continue
+
+        new_value = candidates[0]
+        config["pronunciation"][word] = new_value
+
+        rk = review_key("pronunciation", word)
+        review[rk] = {
+            "word": word,
+            "value": new_value,
+            "section": "pronunciation",
+            "status": "pending",
+            "rejected_alts": rejected_alts,
+        }
+        print(f"  ✓ {word}: {value} → {new_value}")
+        updated += 1
+
+    save_json(CONFIG_PATH, config)
+    save_json(REVIEW_PATH, review)
+    print(f"\nRegenerated {updated}/{len(rejected)} entries.")
+    if updated > 0:
+        print("Run: speak --rewrites test-all")
+
+
+def find_entry(config, key):
+    """Find an entry by key name (checks both sections)."""
+    for section in ("pronunciation", "phrase_rewrites"):
+        for word, value in config.get(section, {}).items():
+            if word == key:
+                return (section, word, value)
+    # Try case-insensitive
+    for section in ("pronunciation", "phrase_rewrites"):
+        for word, value in config.get(section, {}).items():
+            if word.lower() == key.lower():
+                return (section, word, value)
+    return None
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print("Usage: speak --rewrites <command> [key] [value]")
+        print()
+        print("Commands:")
+        print("  list            Show all rewrites with review status")
+        print("  pending         Show only unreviewed entries")
+        print("  accept K        Mark entry K as accepted")
+        print("  reject K        Mark entry K as rejected")
+        print("  unnecessary K   Remove entry (Kokoro already says it right)")
+        print("  fix K VALUE     Change the replacement for K and speak it")
+        print("  test K          Speak the before/after for entry K")
+        print("  test-all        Speak all unreviewed entries")
+        print("  review [FILTER] Re-speak entries to re-evaluate past decisions")
+        print("                    accepted, rejected, unnecessary, pending, all")
+        print("  regenerate      Regenerate all rejected pronunciations via LLM")
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+    config = load_json(CONFIG_PATH)
+    review = load_json(REVIEW_PATH)
+
+    if cmd == "list":
+        cmd_list(config, review)
+    elif cmd == "pending":
+        cmd_pending(config, review)
+    elif cmd == "accept" and len(sys.argv) >= 3:
+        cmd_accept(config, review, " ".join(sys.argv[2:]))
+    elif cmd == "reject" and len(sys.argv) >= 3:
+        cmd_reject(config, review, " ".join(sys.argv[2:]))
+    elif cmd == "unnecessary" and len(sys.argv) >= 3:
+        cmd_unnecessary(config, review, " ".join(sys.argv[2:]))
+    elif cmd == "fix" and len(sys.argv) >= 4:
+        # Everything after the key is the new value — need to split key from value.
+        # Key is argv[2], value is the rest joined.
+        cmd_fix(config, review, sys.argv[2], " ".join(sys.argv[3:]))
+    elif cmd == "test" and len(sys.argv) >= 3:
+        cmd_test(config, " ".join(sys.argv[2:]))
+    elif cmd == "test-all":
+        cmd_test_all(config, review)
+    elif cmd == "review":
+        status_filter = sys.argv[2] if len(sys.argv) >= 3 else "all"
+        cmd_review(config, review, status_filter)
+    elif cmd == "regenerate":
+        cmd_regenerate(config, review)
+    else:
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

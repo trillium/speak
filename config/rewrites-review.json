@@ -1,0 +1,142 @@
+{
+  "pronunciation:daemon": {
+    "word": "daemon",
+    "value": "day-mon",
+    "section": "pronunciation",
+    "status": "accepted",
+    "reviewed_at": 1771638545.2965708
+  },
+  "pronunciation:sqlite": {
+    "word": "sqlite",
+    "value": "S Q lite",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642393.115384
+  },
+  "pronunciation:nginx": {
+    "word": "nginx",
+    "value": "engine X",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642397.696811
+  },
+  "pronunciation:kubectl": {
+    "word": "kubectl",
+    "value": "kube control",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642398.646292
+  },
+  "pronunciation:sudo": {
+    "word": "sudo",
+    "value": "sue-doe",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642411.4259079
+  },
+  "pronunciation:FAISS": {
+    "word": "FAISS",
+    "value": "face",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642440.030317
+  },
+  "pronunciation:macOS": {
+    "word": "macOS",
+    "value": "mac O S",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642444.9785368
+  },
+  "pronunciation:iOS": {
+    "word": "iOS",
+    "value": "eye O S",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642450.344666
+  },
+  "pronunciation:npm": {
+    "word": "npm",
+    "value": "N P M",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642454.268516
+  },
+  "pronunciation:apiKey": {
+    "word": "apiKey",
+    "value": "eh pee eye key",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642460.633902
+  },
+  "pronunciation:ApiKey": {
+    "word": "ApiKey",
+    "value": "eh pee eye key",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642466.1038542
+  },
+  "pronunciation:API_KEY": {
+    "word": "API_KEY",
+    "value": "eh pee eye key",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642470.359384
+  },
+  "pronunciation:api_key": {
+    "word": "api_key",
+    "value": "eh pee eye key",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642480.1377249
+  },
+  "pronunciation:API": {
+    "word": "API",
+    "value": "eh pee eye",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642484.7609868
+  },
+  "pronunciation:APIs": {
+    "word": "APIs",
+    "value": "eh pee eyes",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642491.766655
+  },
+  "pronunciation:phrase": {
+    "word": "phrase",
+    "value": "frays",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642497.442466
+  },
+  "pronunciation:phrases": {
+    "word": "phrases",
+    "value": "frayzes",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771642501.446281
+  },
+  "pronunciation:rewrites": {
+    "word": "rewrites",
+    "value": "ree writes",
+    "section": "pronunciation",
+    "status": "pending",
+    "rejected_alts": ["re-rights"]
+  },
+  "pronunciation:rewrite": {
+    "word": "rewrite",
+    "value": "ree write",
+    "section": "pronunciation",
+    "status": "pending",
+    "rejected_alts": ["re-right"]
+  },
+  "pronunciation:rewriting": {
+    "word": "rewriting",
+    "value": "ree writing",
+    "section": "pronunciation",
+    "status": "pending",
+    "rejected_alts": ["re-righting"]
+  }
+}
