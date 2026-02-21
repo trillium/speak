@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Apply phrase rewrites and pronunciation fixes for TTS output.
+
+Reads text from stdin, applies rewrites from config/rewrites.json, writes to stdout.
+This is a pure text transformation — no LLM calls. Use bin/summarize for that.
+"""
+
+import json
+import os
+import re
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "..", "config", "rewrites.json")
+
+# External TTS pronunciation dictionary (base layer, overridden by local entries)
+DICTIONARY_PATH = os.path.expanduser("~/code/tts-pronunciation-dictionary/flat.json")
+
+
+def load_config():
+    # Load external dictionary as base pronunciation layer
+    pronunciation = {}
+    try:
+        with open(DICTIONARY_PATH) as f:
+            pronunciation = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    # Load local config (overrides external dictionary)
+    try:
+        with open(CONFIG_PATH) as f:
+            config = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        config = {}
+
+    # Merge: local pronunciations override external dictionary
+    pronunciation.update(config.get("pronunciation", {}))
+    config["pronunciation"] = pronunciation
+    config.setdefault("phrase_rewrites", {})
+    return config
+
+
+def split_compound_words(text):
+    """Split snake_case and kebab-case words into separate words.
+
+    Runs before pronunciation rewrites so individual words get handled
+    by their own rules (e.g. api_key -> api key -> eh pee eye key).
+    """
+    # snake_case: replace underscores between word chars with spaces
+    text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
+    # kebab-case: replace hyphens between lowercase/digit chars with spaces
+    # (avoids splitting real hyphens like "well-known" by requiring lowercase on both sides)
+    text = re.sub(r'(?<=[a-z0-9])-(?=[a-z0-9])', ' ', text)
+    return text
+
+
+def apply_phrase_rewrites(text, rewrites):
+    for phrase, replacement in rewrites.items():
+        pattern = re.escape(phrase)
+        text = re.sub(pattern, replacement, text)
+    # Clean up artifacts from removed phrases
+    text = re.sub(r"  +", " ", text)
+    text = re.sub(r"^\s*[.,!?]\s*", "", text)
+    text = re.sub(r"\.\s*[.,!?]", ".", text)
+    return text.strip()
+
+
+def _spell_out(match):
+    """Spell out an all-caps word letter-by-letter, e.g. PID -> P I D."""
+    return " ".join(match.group(0))
+
+
+def apply_pronunciation(text, pronunciation):
+    for word, replacement in pronunciation.items():
+        if word == word.upper() and len(word) > 1:
+            # Acronym: exact case match
+            text = re.sub(r"\b" + re.escape(word) + r"\b", replacement, text)
+        else:
+            # Regular word: case-insensitive
+            text = re.sub(
+                r"\b" + re.escape(word) + r"\b",
+                replacement,
+                text,
+                flags=re.IGNORECASE,
+            )
+    # Catch-all: spell out any remaining all-caps words (2+ letters)
+    # that weren't already handled by explicit pronunciation entries
+    text = re.sub(r"\b[A-Z]{2,}\b", _spell_out, text)
+    return text
+
+
+def main():
+    text = sys.stdin.read().strip()
+    if not text:
+        return
+
+    config = load_config()
+    # Strip machine-readable noise: long hashes, UUIDs, file paths
+    text = re.sub(r'\b[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\b', '', text)  # UUIDs
+    text = re.sub(r'\b[0-9a-f]{12,}\b', '', text)                 # long hex hashes/SHAs
+    text = re.sub(r'(/[\w./-]{20,})', 'the file', text)           # long file paths
+    text = re.sub(r'  +', ' ', text)
+    text = apply_phrase_rewrites(text, config.get("phrase_rewrites", {}))
+    text = apply_pronunciation(text, config.get("pronunciation", {}))
+    text = split_compound_words(text)
+    # Second pass: catch words that were hidden inside snake_case/kebab-case
+    text = apply_pronunciation(text, config.get("pronunciation", {}))
+
+    if text:
+        print(text)
+
+
+if __name__ == "__main__":
+    main()
