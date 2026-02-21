@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Summarize text from stdin into a brief spoken summary.
+# Uses claude -p with Haiku by default. Swap the backend here
+# without changing any callers.
+
+MODEL="claude-haiku-4-5-20251001"
+MAX_WORDS=25
+INPUT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)    MODEL="$2"; shift 2 ;;
+        --max-words) MAX_WORDS="$2"; shift 2 ;;
+        *)          shift ;;
+    esac
+done
+
+INPUT="$(cat)"
+
+if [[ -z "${INPUT}" ]]; then
+    exit 0
+fi
+
+# If text is already short enough, pass it through as-is
+WORD_COUNT=$(echo "${INPUT}" | wc -w | tr -d ' ')
+if [[ "${WORD_COUNT}" -le "${MAX_WORDS}" ]]; then
+    printf '%s' "${INPUT}"
+    exit 0
+fi
+
+PROMPT="Summarize in 1-2 sentences, max ${MAX_WORDS} words. Past tense. Concrete about what was done. No filler phrases, no hedging, no \"I\" statements. Just the facts. IMPORTANT: Remove any long hashes, UUIDs, conversation IDs, commit SHAs, file paths, and other machine-readable strings — replace them with plain descriptions like \"the commit\" or \"the file\" instead. The output will be read aloud so it must sound natural:
+
+${INPUT}"
+
+# Unset CLAUDECODE to allow running from within hooks
+RESULT=$(env -u CLAUDECODE claude -p --model "${MODEL}" "${PROMPT}" 2>/dev/null) || true
+
+if [[ -n "${RESULT}" ]]; then
+    printf '%s' "${RESULT}"
+else
+    # Fallback: first sentence
+    printf '%s' "${INPUT}" | head -c 300 | sed 's/\..*/\./'
+fi
