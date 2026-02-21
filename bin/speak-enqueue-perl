@@ -1,0 +1,79 @@
+#!/usr/bin/perl
+# speak-enqueue-perl: Fast enqueue client using system Perl.
+# No CPAN modules needed — IO::Socket::UNIX and Socket are core.
+#
+# Usage: speak-enqueue-perl [-v voice] [-s speed] [-c caller] TEXT...
+#    or: echo TEXT | speak-enqueue-perl [-v voice] [-s speed] [-c caller]
+
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+use Getopt::Std;
+
+my %opts;
+getopts('v:s:c:', \%opts);
+my $voice  = $opts{v} || 'af_heart';
+my $speed  = $opts{s} || '1.26';
+my $caller = $opts{c} || '';
+
+# Collect text from args or stdin
+my $text;
+if (@ARGV) {
+    $text = join(' ', @ARGV);
+} elsif (!-t STDIN) {
+    local $/;
+    $text = <STDIN>;
+    $text =~ s/\s+$//;
+} else {
+    die "speak-enqueue-perl: no text\n";
+}
+die "speak-enqueue-perl: empty text\n" unless $text;
+
+# JSON-escape text
+$text =~ s/\\/\\\\/g;
+$text =~ s/"/\\"/g;
+$text =~ s/\n/\\n/g;
+$text =~ s/\r/\\r/g;
+$text =~ s/\t/\\t/g;
+
+# Build JSON
+my $caller_field = $caller ? qq(,"caller":"$caller") : '';
+my $msg = qq({"enqueue":true,"text":"$text","voice":"$voice","speed":$speed$caller_field});
+
+# Connect to daemon
+my $sock_path = $ENV{SPEAK_SOCK} || "/tmp/speak-$ENV{USER}.sock";
+my $sock = IO::Socket::UNIX->new(
+    Peer => $sock_path,
+    Type => SOCK_STREAM,
+) or die "speak-enqueue-perl: daemon not running (start with: speak --daemon)\n";
+
+# Send length-prefixed message
+$sock->send(pack("N", length($msg)) . $msg);
+
+# Read response: 4-byte length + payload + 4-byte zero terminator
+my $raw_len;
+$sock->recv($raw_len, 4);
+my $resp_len = unpack("N", $raw_len);
+if ($resp_len > 0) {
+    my $data = '';
+    while (length($data) < $resp_len) {
+        my $chunk;
+        $sock->recv($chunk, $resp_len - length($data));
+        last unless $chunk;
+        $data .= $chunk;
+    }
+    # Print position to stderr
+    if ($data =~ /"position"\s*:\s*(\d+)/) {
+        print STDERR "queued (position $1)\n";
+    }
+    if ($data !~ /"ok"/ || $data =~ /false/) {
+        print STDERR "speak-enqueue-perl: $data\n";
+        $sock->close;
+        exit 1;
+    }
+    # Consume zero terminator
+    $sock->recv(my $term, 4);
+}
+
+$sock->close;
+exit 0;
