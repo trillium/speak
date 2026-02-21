@@ -8,9 +8,27 @@ SOCK_PATH="/tmp/speak-${USER}.sock"
 ENGINE="kokoro"
 DEFAULT_KOKORO_VOICE="af_heart"
 DEFAULT_PIPER_VOICE="en_US-ryan-high"
-SPEED="1.0"
+SPEED="1.26"
 SAVE_FILE=""
 VOICE=""
+CALLER="${SPEAK_CALLER:-}"
+ENQUEUE_BACKEND="${SPEAK_ENQUEUE_BACKEND:-auto}"  # auto, c, perl, python
+FLAGGED_FILE="${SCRIPT_DIR}/../config/flagged.json"
+
+# Auto-detect caller from git repo name or cwd basename
+_auto_detect_caller() {
+    # Explicit --caller or SPEAK_CALLER takes priority
+    if [[ -n "${CALLER}" ]]; then
+        return
+    fi
+    # Try git repo name first
+    local repo_root
+    if repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+        CALLER="$(basename "${repo_root}")"
+    else
+        CALLER="$(basename "${PWD}")"
+    fi
+}
 
 usage() {
     cat <<'EOF'
@@ -23,11 +41,33 @@ Text can be provided as arguments or piped via stdin.
 Options:
   --engine ENGINE   TTS engine: kokoro (default) or piper
   --voice NAME      Voice name (default: af_heart for kokoro, en_US-ryan-high for piper)
-  --speed FLOAT     Speech speed (default: 1.0)
+  --speed FLOAT     Speech speed (default: 1.26)
   --save FILE       Save to WAV file instead of playing
   --voices          List available voices for the selected engine
   --daemon          Show daemon status / start it
   --stop            Stop the daemon
+  --enqueue         Queue text and return immediately (no blocking)
+  --queue           Show playback queue status
+  --skip            Skip currently playing queued item
+  --clear           Clear pending playback queue
+  --replay          Replay the last queued item
+  --stats           Show daemon stats (uptime, cache, queue totals)
+  --caller NAME     Caller identity (plays a unique tone per caller)
+  --history [N]     Show last N spoken texts as JSON array (default: 10)
+  --flag WORD/PHRASE  Flag a word or phrase that sounds wrong (triage later)
+  --flagged         Show all flagged words/phrases
+  --unflag WORD     Remove a word/phrase from the flagged list
+  --rewrites CMD    Manage pronunciation/phrase rewrites:
+                      list            Show all rewrites with review status
+                      pending         Show unreviewed entries
+                      accept K        Mark entry K as accepted
+                      reject K        Mark entry K as rejected
+                      unnecessary K   Remove entry (Kokoro says it right)
+                      fix K VALUE     Change the replacement for K and speak it
+                      test K          Speak the before/after for entry K
+                      test-all        Speak all unreviewed entries
+                      review [F]      Re-speak by status (accepted/rejected/...)
+                      regenerate      Regenerate all rejected via LLM
   -h, --help        Show this help
 
 Kokoro voices (prefix: af_=American female, am_=American male, bf_/bm_=British):
@@ -42,6 +82,11 @@ Examples:
   speak --speed 1.2 "Faster speech"
   speak --save output.wav "Saved to file"
   speak --voices
+  speak --enqueue "first" && speak --enqueue "second"
+  speak --queue
+  speak --skip
+  speak --clear
+  speak --replay
 EOF
     exit 0
 }
@@ -49,7 +94,7 @@ EOF
 # --- Dependency checks ---
 missing=()
 command -v uv    >/dev/null 2>&1 || missing+=(uv)
-command -v play >/dev/null 2>&1 || missing+=(sox)
+command -v ffplay >/dev/null 2>&1 || missing+=(ffmpeg)
 
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "speak: missing required tools: ${missing[*]}" >&2
@@ -75,10 +120,11 @@ start_daemon() {
         return 1
     fi
 
-    echo "speak: starting daemon..." >&2
+    local logfile="${SOCK_PATH}.log"
+    echo "speak: starting daemon... (log: ${logfile})" >&2
     uv run --python 3.14 --with kokoro-onnx -- \
         python3 "${SCRIPT_DIR}/speak-daemon" \
-            --model "${model}" --voices "${voices}" &
+            --model "${model}" --voices "${voices}" 2>"${logfile}" &
     disown
 
     # Wait for socket to appear
@@ -114,6 +160,8 @@ stop_daemon() {
 # --- Parse arguments ---
 LIST_VOICES=false
 DAEMON_CMD=""
+ENQUEUE=false
+QUEUE_CMD=""
 TEXT_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -125,6 +173,64 @@ while [[ $# -gt 0 ]]; do
         --voices)     LIST_VOICES=true; shift ;;
         --daemon)     DAEMON_CMD="status"; shift ;;
         --stop)       DAEMON_CMD="stop"; shift ;;
+        --caller)     CALLER="$2"; shift 2 ;;
+        --enqueue)    ENQUEUE=true; shift ;;
+        --queue)      QUEUE_CMD="queue_status"; shift ;;
+        --skip)       QUEUE_CMD="skip"; shift ;;
+        --clear)      QUEUE_CMD="clear"; shift ;;
+        --replay)     QUEUE_CMD="replay"; shift ;;
+        --stats)      QUEUE_CMD="stats"; shift ;;
+        --history)
+            HISTORY_N="${2:-10}"; shift
+            # Shift again only if $2 was a number (not another flag or end of args)
+            if [[ "${HISTORY_N}" =~ ^[0-9]+$ ]]; then
+                shift 2>/dev/null || true
+            else
+                HISTORY_N=10
+            fi
+            QUEUE_CMD="history"
+            ;;
+        --flag)
+            shift
+            _flag_phrase="$*"
+            if [[ -z "${_flag_phrase}" ]]; then
+                echo "speak: --flag requires a word or phrase" >&2; exit 1
+            fi
+            if [[ ! -f "${FLAGGED_FILE}" ]]; then
+                echo '[]' > "${FLAGGED_FILE}"
+            fi
+            _flag_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            _flag_tmp="$(mktemp)"
+            jq --arg w "${_flag_phrase}" --arg t "${_flag_ts}" \
+                '. + [{"text": $w, "flagged_at": $t}]' "${FLAGGED_FILE}" > "${_flag_tmp}" \
+                && mv "${_flag_tmp}" "${FLAGGED_FILE}"
+            echo "Flagged: ${_flag_phrase}"
+            exit 0
+            ;;
+        --flagged)
+            if [[ ! -f "${FLAGGED_FILE}" ]] || [[ "$(jq length "${FLAGGED_FILE}")" == "0" ]]; then
+                echo "No flagged words/phrases."
+            else
+                jq -r '.[] | "\(.text)  (\(.flagged_at))"' "${FLAGGED_FILE}"
+            fi
+            exit 0
+            ;;
+        --unflag)
+            shift
+            _flag_phrase="$*"
+            if [[ -z "${_flag_phrase}" ]]; then
+                echo "speak: --unflag requires a word or phrase" >&2; exit 1
+            fi
+            if [[ -f "${FLAGGED_FILE}" ]]; then
+                _flag_tmp="$(mktemp)"
+                jq --arg w "${_flag_phrase}" '[.[] | select(.text != $w)]' "${FLAGGED_FILE}" > "${_flag_tmp}" \
+                    && mv "${_flag_tmp}" "${FLAGGED_FILE}"
+            fi
+            echo "Unflagged: ${_flag_phrase}"
+            exit 0
+            ;;
+        --rewrites)   python3 "${SCRIPT_DIR}/speak-test-rewrites" "${@:2}"; exit $? ;;
+        --enqueue-backend) ENQUEUE_BACKEND="$2"; shift 2 ;;
         --)           shift; TEXT_ARGS+=("$@"); break ;;
         *)            TEXT_ARGS+=("$1"); shift ;;
     esac
@@ -142,6 +248,37 @@ if [[ "${DAEMON_CMD}" == "status" ]]; then
     else
         echo "speak: daemon not running, starting..." >&2
         start_daemon
+    fi
+    exit 0
+fi
+
+# --- Handle queue commands (require running daemon) ---
+if [[ -n "${QUEUE_CMD}" ]]; then
+    if ! daemon_is_running; then
+        echo "speak: daemon not running (start with: speak --daemon)" >&2
+        exit 1
+    fi
+    if [[ "${QUEUE_CMD}" == "history" ]]; then
+        python3 -c "
+import socket, struct, json, os, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+msg = json.dumps({'command': 'history', 'n': ${HISTORY_N:-10}}).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+# Read response
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = sock.recv(resp_len)
+    resp = json.loads(data)
+    entries = resp.get('entries', [])
+    json.dump(entries, sys.stdout, indent=2)
+    print()
+sock.close()
+"
+    else
+        python3 "${SCRIPT_DIR}/speak-client" --command "${QUEUE_CMD}"
     fi
     exit 0
 fi
@@ -201,7 +338,53 @@ speak_kokoro() {
         }
     fi
 
-    if [[ -n "${SAVE_FILE}" ]]; then
+    if [[ "${ENQUEUE}" == true ]]; then
+        # Auto-detect caller if not explicitly set
+        _auto_detect_caller
+
+        # Resolve backend: auto picks fastest available
+        local backend="${ENQUEUE_BACKEND}"
+        if [[ "${backend}" == "auto" ]]; then
+            if [[ -x "${SCRIPT_DIR}/speak-enqueue" ]]; then
+                backend="c"
+            elif command -v perl >/dev/null 2>&1; then
+                backend="perl"
+            else
+                backend="python"
+            fi
+        fi
+
+        case "${backend}" in
+            c)
+                local caller_flag=()
+                if [[ -n "${CALLER}" ]]; then
+                    caller_flag=(-c "${CALLER}")
+                fi
+                printf '%s' "${TEXT}" | "${SCRIPT_DIR}/speak-enqueue" \
+                    -v "${VOICE}" -s "${SPEED}" "${caller_flag[@]}"
+                ;;
+            perl)
+                local caller_flag=()
+                if [[ -n "${CALLER}" ]]; then
+                    caller_flag=(-c "${CALLER}")
+                fi
+                printf '%s' "${TEXT}" | "${SCRIPT_DIR}/speak-enqueue-perl" \
+                    -v "${VOICE}" -s "${SPEED}" "${caller_flag[@]}"
+                ;;
+            python)
+                local caller_flag=()
+                if [[ -n "${CALLER}" ]]; then
+                    caller_flag=(--caller "${CALLER}")
+                fi
+                printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
+                    --enqueue --voice "${VOICE}" --speed "${SPEED}" "${caller_flag[@]}"
+                ;;
+            *)
+                echo "speak: unknown enqueue backend '${backend}' (use c, perl, or python)" >&2
+                exit 1
+                ;;
+        esac
+    elif [[ -n "${SAVE_FILE}" ]]; then
         # For --save, use kokoro-tts CLI directly (produces proper WAV headers)
         local model="${KOKORO_DIR}/kokoro-v1.0.onnx"
         local voices="${KOKORO_DIR}/voices-v1.0.bin"
@@ -210,10 +393,10 @@ speak_kokoro() {
             --model "${model}" --voices "${voices}" 2>&1 | grep -v "^Consider"
         echo "speak: saved to ${SAVE_FILE}" >&2
     else
-        # Stream via daemon -> speak-client -> play (sox)
+        # Stream via daemon -> speak-client -> ffplay
         printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
                 --voice "${VOICE}" --speed "${SPEED}" \
-        | play -r 24000 -b 16 -e signed -c 1 -t raw -
+        | ffplay -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -i pipe:0 -loglevel quiet
     fi
 }
 
@@ -231,7 +414,7 @@ speak_kokoro_direct() {
         python3 "${SCRIPT_DIR}/kokoro-stream" \
             --model "${model}" --voices "${voices}" \
             --voice "${VOICE}" --speed "${SPEED}" \
-    | play -r 24000 -b 16 -e signed -c 1 -t raw -
+    | ffplay -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -i pipe:0 -loglevel quiet
 }
 
 # =============================================================================
@@ -278,7 +461,7 @@ speak_piper() {
             piper -m "${model}" -c "${config}" \
                   --length-scale "${SPEED}" \
                   --output-raw \
-        | play -r "${sample_rate}" -b 16 -e signed -c 1 -t raw -
+        | ffplay -nodisp -autoexit -f s16le -ar "${sample_rate}" -ch_layout mono -i pipe:0 -loglevel quiet
     fi
 }
 
