@@ -8,31 +8,91 @@ import struct
 import sys
 
 
+def _send_request(sock, request_dict):
+    """Send a length-prefixed JSON request."""
+    payload = json.dumps(request_dict).encode()
+    sock.sendall(struct.pack("!I", len(payload)))
+    sock.sendall(payload)
+
+
+def _read_json_response(sock):
+    """Read a length-prefixed JSON response (first chunk), consuming the zero terminator."""
+    raw_len = _recvall(sock, 4)
+    if not raw_len:
+        return None
+    chunk_len = struct.unpack("!I", raw_len)[0]
+    if chunk_len == 0:
+        return None
+    data = _recvall(sock, chunk_len)
+    if not data:
+        return None
+    # Consume the zero-length terminator
+    term = _recvall(sock, 4)
+    if term:
+        struct.unpack("!I", term)  # should be 0
+    return json.loads(data.decode())
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--voice", default="af_heart")
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--lang", default="en-us")
+    parser.add_argument("--enqueue", action="store_true",
+                        help="Enqueue text for playback and return immediately")
+    parser.add_argument("--caller", default="",
+                        help="Caller identity for distinct audio tones")
+    parser.add_argument("--command",
+                        help="Send a queue command (queue_status, skip, clear, replay)")
     args = parser.parse_args()
-
-    text = sys.stdin.read().strip()
-    if not text:
-        return
 
     sock_path = f"/tmp/speak-{os.environ['USER']}.sock"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)
 
-    # Send length-prefixed JSON request
-    request = json.dumps({
+    # --- Command mode (no text needed) ---
+    if args.command:
+        _send_request(sock, {"command": args.command})
+        resp = _read_json_response(sock)
+        sock.close()
+        if resp:
+            print(json.dumps(resp, indent=2))
+        return
+
+    text = sys.stdin.read().strip()
+    if not text:
+        sock.close()
+        return
+
+    # --- Enqueue mode ---
+    if args.enqueue:
+        req = {
+            "enqueue": True,
+            "text": text,
+            "voice": args.voice,
+            "speed": args.speed,
+            "lang": args.lang,
+        }
+        if args.caller:
+            req["caller"] = args.caller
+        _send_request(sock, req)
+        resp = _read_json_response(sock)
+        sock.close()
+        if resp and resp.get("ok"):
+            print(f"queued (position {resp['position']})", file=sys.stderr)
+        elif resp:
+            print(f"speak-client: enqueue failed: {resp}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- Original streaming mode ---
+    _send_request(sock, {
         "text": text,
         "voice": args.voice,
         "speed": args.speed,
         "lang": args.lang,
-    }).encode()
-    sock.sendall(struct.pack("!I", len(request)))
-    sock.sendall(request)
+    })
 
     # Read length-prefixed PCM chunks and write to stdout
     while True:
