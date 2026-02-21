@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """Speak daemon — keeps Kokoro model loaded, serves TTS over Unix socket.
 
-Streams audio at sentence granularity: the first sentence starts playing
-while subsequent sentences are still being synthesized.
+Streams audio at clause granularity: the first clause starts playing
+while subsequent clauses are still being synthesized.
+
+Two-tier audio cache:
+  1. Clause cache — keyed by full clause text, highest quality (natural coarticulation)
+  2. Word cache  — keyed by per-word phonemes, enables fast assembly of novel clauses
+     from previously-heard words. Background synthesis upgrades to clause cache.
+
+Cache entries expire after CACHE_TTL_DAYS days.
 """
 
 import asyncio
+import hashlib
 import json
 import os
+import pathlib
 import re
 import signal
 import struct
@@ -18,13 +27,15 @@ import numpy as np
 from kokoro_onnx import Kokoro
 
 # Fix kokoro-onnx bug: speed dtype is np.int32 instead of np.float32
-# for models using input_ids format (v1.0 models)
+# for models using input_ids format (v1.0 models).
+# The bug: np.array([1.8], dtype=np.int32) truncates to [1], losing the
+# fractional speed value. We must inject the original float BEFORE int truncation.
 _orig_create_audio = Kokoro._create_audio
 def _fixed_create_audio(self, phonemes, voice, speed):
     orig_run = self.sess.run
     def patched_run(output_names, inputs, *args, **kwargs):
-        if "speed" in inputs and hasattr(inputs["speed"], "dtype"):
-            inputs["speed"] = np.array(inputs["speed"], dtype=np.float32)
+        if "speed" in inputs:
+            inputs["speed"] = np.array([speed], dtype=np.float32)
         return orig_run(output_names, inputs, *args, **kwargs)
     self.sess.run = patched_run
     try:
@@ -38,6 +49,24 @@ _CLAUSE_RE = re.compile(r'(?<=[.!?,;:\u2014—-])\s+')
 
 SOCKET_PATH = f"/tmp/speak-{os.environ['USER']}.sock"
 IDLE_TIMEOUT = 300  # shut down after 5 minutes idle
+CACHE_DIR = pathlib.Path(os.environ.get(
+    "SPEAK_CACHE_DIR",
+    f"/tmp/speak-cache-{os.environ['USER']}",
+))
+CACHE_TTL_DAYS = int(os.environ.get("SPEAK_CACHE_TTL_DAYS", "3"))
+STATE_PATH = f"/tmp/speak-{os.environ['USER']}.state.json"
+
+
+def _publish_state(state: dict):
+    """Write current state to a JSON file for external tools to monitor."""
+    state["timestamp"] = time.time()
+    tmp = STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass
 
 
 def split_clauses(text: str) -> list[str]:
@@ -46,20 +75,774 @@ def split_clauses(text: str) -> list[str]:
     return [s.strip() for s in parts if s.strip()]
 
 
+SAMPLE_RATE = 24000
+CROSSFADE_MS = 5          # crossfade ramp at word joins (avoids clicks)
+SILENCE_GAP_MS = 30       # silence inserted between assembled words
+CROSSFADE_SAMPLES = int(SAMPLE_RATE * CROSSFADE_MS / 1000)
+SILENCE_SAMPLES = int(SAMPLE_RATE * SILENCE_GAP_MS / 1000)
+
+# Energy threshold for silence detection (relative to peak)
+SILENCE_THRESHOLD = 0.02
+SILENCE_MIN_SAMPLES = int(SAMPLE_RATE * 0.02)  # 20ms minimum gap to count as word boundary
+
+
+def _generate_separator_tone() -> bytes:
+    """Generate a gentle two-note chime to separate queue items.
+
+    A soft ascending two-tone (E5 → G5) with fade in/out, ~300ms total.
+    """
+    duration = 0.15  # per note
+    volume = 0.08    # gentle
+    t1 = np.linspace(0, duration, int(SAMPLE_RATE * duration), dtype=np.float32)
+    t2 = np.linspace(0, duration, int(SAMPLE_RATE * duration), dtype=np.float32)
+
+    # E5 (659 Hz) then G5 (784 Hz)
+    note1 = np.sin(2 * np.pi * 659 * t1) * volume
+    note2 = np.sin(2 * np.pi * 784 * t2) * volume
+
+    # Apply fade in/out envelope to each note
+    fade_len = int(SAMPLE_RATE * 0.03)  # 30ms fade
+    for note in (note1, note2):
+        note[:fade_len] *= np.linspace(0, 1, fade_len)
+        note[-fade_len:] *= np.linspace(1, 0, fade_len)
+
+    # 50ms silence before, 30ms gap between notes, 80ms silence after
+    silence_before = np.zeros(int(SAMPLE_RATE * 0.05), dtype=np.float32)
+    gap = np.zeros(int(SAMPLE_RATE * 0.03), dtype=np.float32)
+    silence_after = np.zeros(int(SAMPLE_RATE * 0.08), dtype=np.float32)
+
+    tone = np.concatenate([silence_before, note1, gap, note2, silence_after])
+    pcm_int16 = (tone * 32767).astype(np.int16)
+    return pcm_int16.tobytes()
+
+
+SEPARATOR_TONE = _generate_separator_tone()
+
+# Silence gap between different callers (after end tone, before next start tone)
+CALLER_GAP = np.zeros(int(SAMPLE_RATE * 1.0), dtype=np.int16).tobytes()  # 1s silence
+
+
+def _generate_caller_tone(caller: str) -> bytes:
+    """Generate a unique tone for a caller, derived from their name.
+
+    Each caller gets:
+    - A distinct number of beeps (1, 2, or 3) for easy aural identification
+    - Unique pitches from the pentatonic scale
+    - Beep count cycles through [1, 2, 3] based on caller ordering, so
+      callers encountered in sequence always sound distinct
+    """
+    # Pentatonic scale frequencies — wide spread for maximum distinctness
+    TONE_SETS = [
+        # 1-beep patterns: single distinct pitch
+        [(523.25,)],   # C5
+        [(440.00,)],   # A4
+        [(659.25,)],   # E5
+        # 2-beep patterns: ascending or descending intervals
+        [(329.63, 523.25)],   # E4 → C5 (ascending 4th)
+        [(783.99, 440.00)],   # G5 → A4 (descending)
+        [(293.66, 587.33)],   # D4 → D5 (octave leap)
+        # 3-beep patterns: melodic fragments
+        [(392.00, 523.25, 659.25)],   # G4 → C5 → E5 (major arpeggio)
+        [(880.00, 659.25, 523.25)],   # A5 → E5 → C5 (descending)
+        [(329.63, 440.00, 587.33)],   # E4 → A4 → D5 (rising)
+    ]
+    h = int(hashlib.md5(caller.encode()).hexdigest()[:8], 16)
+    pattern = TONE_SETS[h % len(TONE_SETS)]
+    freqs = pattern[0]
+
+    # Vary duration by beep count: 1-beep=longer, 3-beep=shorter
+    duration = {1: 0.16, 2: 0.12, 3: 0.08}[len(freqs)]
+    volume = 0.10
+    fade_len = int(SAMPLE_RATE * 0.015)
+    gap = np.zeros(int(SAMPLE_RATE * 0.04), dtype=np.float32)
+
+    parts = [np.zeros(int(SAMPLE_RATE * 0.04), dtype=np.float32)]  # leading silence
+    for i, freq in enumerate(freqs):
+        t = np.linspace(0, duration, int(SAMPLE_RATE * duration), dtype=np.float32)
+        note = np.sin(2 * np.pi * freq * t) * volume
+        note[:fade_len] *= np.linspace(0, 1, fade_len)
+        note[-fade_len:] *= np.linspace(1, 0, fade_len)
+        parts.append(note)
+        if i < len(freqs) - 1:
+            parts.append(gap)
+    parts.append(np.zeros(int(SAMPLE_RATE * 0.06), dtype=np.float32))  # trailing silence
+
+    tone = np.concatenate(parts)
+    pcm_int16 = (tone * 32767).astype(np.int16)
+    return pcm_int16.tobytes()
+
+
+# Cache caller tones so we don't regenerate each time
+_caller_tone_cache: dict[str, bytes] = {}
+
+
+def get_caller_tone(caller: str) -> bytes:
+    if caller not in _caller_tone_cache:
+        _caller_tone_cache[caller] = _generate_caller_tone(caller)
+    return _caller_tone_cache[caller]
+
+
+# Voice assignments per caller. Callers not listed use the request's voice.
+# This can be overridden via a config file in the future.
+# Map caller names to (voice, gain) tuples.
+# Gain 1.0 = no change, >1.0 = louder. Adjust per voice to normalize volume.
+CALLER_VOICES: dict[str, tuple[str, float]] = {
+    "speak": ("af_heart", 1.0),
+    "happy": ("am_adam", 1.0),
+    "ops":   ("af_nova", 1.5),     # nova is quiet by default
+}
+
+
+def get_caller_voice(caller: str, default_voice: str) -> tuple[str, float]:
+    """Return (voice_name, gain) for a caller."""
+    return CALLER_VOICES.get(caller, (default_voice, 1.0))
+
+
+def _detect_word_boundaries(audio: np.ndarray, n_words: int) -> list[tuple[int, int]]:
+    """Find word boundaries in synthesized audio using energy-based silence detection.
+
+    Returns list of (start, end) sample indices for each word segment.
+    Falls back to equal division if silence detection doesn't find enough boundaries.
+    """
+    # Compute short-time energy (5ms frames)
+    frame_len = int(SAMPLE_RATE * 0.005)
+    n_frames = len(audio) // frame_len
+    if n_frames == 0:
+        return [(0, len(audio))]
+
+    frames = audio[:n_frames * frame_len].reshape(n_frames, frame_len)
+    energy = np.mean(frames ** 2, axis=1)
+    peak_energy = np.max(energy) if np.max(energy) > 0 else 1.0
+    is_silent = energy < (peak_energy * SILENCE_THRESHOLD)
+
+    # Find silent regions (consecutive silent frames)
+    boundaries = []
+    in_silence = False
+    silence_start = 0
+    for i, silent in enumerate(is_silent):
+        if silent and not in_silence:
+            silence_start = i
+            in_silence = True
+        elif not silent and in_silence:
+            silence_len = (i - silence_start) * frame_len
+            if silence_len >= SILENCE_MIN_SAMPLES:
+                # Midpoint of the silence as the boundary
+                mid_sample = ((silence_start + i) // 2) * frame_len
+                boundaries.append(mid_sample)
+            in_silence = False
+
+    # We need exactly n_words - 1 boundaries
+    if len(boundaries) < n_words - 1:
+        # Not enough silence gaps found — fall back to equal division
+        segment_len = len(audio) // n_words
+        return [(i * segment_len, (i + 1) * segment_len) for i in range(n_words)]
+
+    # Take the n_words-1 most prominent boundaries (widest silences)
+    # Actually, just take the first n_words-1 since they're in order
+    boundaries = boundaries[:n_words - 1]
+    segments = []
+    prev = 0
+    for b in boundaries:
+        segments.append((prev, b))
+        prev = b
+    segments.append((prev, len(audio)))
+    return segments
+
+
+def _assemble_word_audio(word_pcm_list: list[bytes]) -> bytes:
+    """Join word PCM segments with silence gaps and crossfade to avoid clicks."""
+    if len(word_pcm_list) == 1:
+        return word_pcm_list[0]
+
+    silence = np.zeros(SILENCE_SAMPLES, dtype=np.int16)
+    fade_in = np.linspace(0, 1, CROSSFADE_SAMPLES, dtype=np.float32)
+    fade_out = np.linspace(1, 0, CROSSFADE_SAMPLES, dtype=np.float32)
+
+    parts = []
+    for i, pcm_bytes in enumerate(word_pcm_list):
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).copy()
+        # Apply fade-out to end of each word (except last)
+        if len(samples) > CROSSFADE_SAMPLES:
+            if i < len(word_pcm_list) - 1:
+                samples[-CROSSFADE_SAMPLES:] = (
+                    samples[-CROSSFADE_SAMPLES:].astype(np.float32) * fade_out
+                ).astype(np.int16)
+            # Apply fade-in to start of each word (except first)
+            if i > 0:
+                samples[:CROSSFADE_SAMPLES] = (
+                    samples[:CROSSFADE_SAMPLES].astype(np.float32) * fade_in
+                ).astype(np.int16)
+        parts.append(samples)
+        if i < len(word_pcm_list) - 1:
+            parts.append(silence)
+
+    return np.concatenate(parts).tobytes()
+
+
+class AudioCache:
+    """Two-tier disk cache: clause-level (high quality) and word-level (fast assembly).
+
+    Each entry consists of two files:
+      <hash>      — raw PCM bytes (int16, 24kHz mono)
+      <hash>.meta — JSON metadata: voice, speed, hits, created_at, label
+    """
+
+    def __init__(self, cache_dir: pathlib.Path, ttl_days: int):
+        self.clause_dir = cache_dir / "clauses"
+        self.word_dir = cache_dir / "words"
+        self.ttl_secs = ttl_days * 86400
+        self.clause_dir.mkdir(parents=True, exist_ok=True)
+        self.word_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _hash(raw: str) -> str:
+        return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+    # --- metadata helpers ---
+
+    @staticmethod
+    def _read_meta(path: pathlib.Path) -> dict:
+        try:
+            return json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _write_meta(path: pathlib.Path, meta: dict) -> None:
+        path.write_text(json.dumps(meta, separators=(",", ":")))
+
+    @staticmethod
+    def _bump_hits(meta_path: pathlib.Path) -> None:
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        meta["hits"] = meta.get("hits", 0) + 1
+        meta["last_hit"] = time.time()
+        meta_path.write_text(json.dumps(meta, separators=(",", ":")))
+
+    # --- Clause cache (tier 1) ---
+
+    def get_clause(self, text: str, voice: str, speed: float) -> bytes | None:
+        h = self._hash(f"{text}|{voice}|{speed:.2f}")
+        pcm_path = self.clause_dir / h
+        meta_path = self.clause_dir / f"{h}.meta"
+        if not pcm_path.exists():
+            return None
+        if time.time() - pcm_path.stat().st_mtime > self.ttl_secs:
+            pcm_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+            return None
+        self._bump_hits(meta_path)
+        return pcm_path.read_bytes()
+
+    def put_clause(self, text: str, voice: str, speed: float, pcm: bytes) -> None:
+        h = self._hash(f"{text}|{voice}|{speed:.2f}")
+        (self.clause_dir / h).write_bytes(pcm)
+        meta_path = self.clause_dir / f"{h}.meta"
+        existing = self._read_meta(meta_path)
+        self._write_meta(meta_path, {
+            "voice": voice, "speed": speed,
+            "hits": existing.get("hits", 0),
+            "created_at": existing.get("created_at", time.time()),
+            "text": text[:200],
+        })
+
+    # --- Word cache (tier 2) ---
+
+    def get_word(self, phonemes: str, voice: str, speed: float) -> bytes | None:
+        h = self._hash(f"{phonemes}|{voice}|{speed:.2f}")
+        pcm_path = self.word_dir / h
+        meta_path = self.word_dir / f"{h}.meta"
+        if not pcm_path.exists():
+            return None
+        if time.time() - pcm_path.stat().st_mtime > self.ttl_secs:
+            pcm_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+            return None
+        self._bump_hits(meta_path)
+        return pcm_path.read_bytes()
+
+    def put_word(self, phonemes: str, voice: str, speed: float, pcm: bytes) -> None:
+        h = self._hash(f"{phonemes}|{voice}|{speed:.2f}")
+        (self.word_dir / h).write_bytes(pcm)
+        meta_path = self.word_dir / f"{h}.meta"
+        existing = self._read_meta(meta_path)
+        self._write_meta(meta_path, {
+            "voice": voice, "speed": speed,
+            "hits": existing.get("hits", 0),
+            "created_at": existing.get("created_at", time.time()),
+            "phonemes": phonemes,
+        })
+
+    def assemble_from_words(
+        self, word_phonemes: list[str], voice: str, speed: float
+    ) -> bytes | None:
+        """Try to assemble full audio from cached words. Returns None if any word is missing."""
+        word_pcms = []
+        for wp in word_phonemes:
+            pcm = self.get_word(wp, voice, speed)
+            if pcm is None:
+                return None
+            word_pcms.append(pcm)
+        return _assemble_word_audio(word_pcms)
+
+    def extract_and_cache_words(
+        self, word_phonemes: list[str], audio: np.ndarray, voice: str, speed: float
+    ) -> None:
+        """Extract individual word audio from a full synthesis and cache each word."""
+        if len(word_phonemes) <= 1:
+            # Single word — cache the whole thing
+            if word_phonemes:
+                pcm = (audio * 32767).astype(np.int16).tobytes()
+                self.put_word(word_phonemes[0], voice, speed, pcm)
+            return
+
+        segments = _detect_word_boundaries(audio, len(word_phonemes))
+        for wp, (start, end) in zip(word_phonemes, segments):
+            segment = audio[start:end]
+            if len(segment) > 0:
+                pcm = (segment * 32767).astype(np.int16).tobytes()
+                self.put_word(wp, voice, speed, pcm)
+
+    def evict_expired(self) -> int:
+        """Remove all expired entries across both tiers. Returns count removed."""
+        now = time.time()
+        removed = 0
+        for d in (self.clause_dir, self.word_dir):
+            for path in d.iterdir():
+                if path.suffix == ".meta":
+                    continue  # cleaned up with its PCM file
+                if path.is_file() and (now - path.stat().st_mtime) > self.ttl_secs:
+                    path.unlink(missing_ok=True)
+                    pathlib.Path(f"{path}.meta").unlink(missing_ok=True)
+                    removed += 1
+        return removed
+
+    def disk_size(self) -> int:
+        """Return total disk usage of the cache in bytes."""
+        total = 0
+        for d in (self.clause_dir, self.word_dir):
+            for path in d.iterdir():
+                if path.is_file():
+                    total += path.stat().st_size
+        return total
+
+    def stats(self) -> dict:
+        """Return cache statistics including hit counts per voice."""
+        result = {"clauses": 0, "words": 0, "clause_hits": 0, "word_hits": 0, "voices": {}}
+        for tier, d in [("clause", self.clause_dir), ("word", self.word_dir)]:
+            for meta_path in d.glob("*.meta"):
+                meta = self._read_meta(meta_path)
+                hits = meta.get("hits", 0)
+                voice = meta.get("voice", "unknown")
+                result[f"{tier}s"] += 1
+                result[f"{tier}_hits"] += hits
+                if voice not in result["voices"]:
+                    result["voices"][voice] = {"clauses": 0, "words": 0, "hits": 0}
+                result["voices"][voice][f"{tier}s"] += 1
+                result["voices"][voice]["hits"] += hits
+        result["disk_bytes"] = self.disk_size()
+        return result
+
+
+class PlaybackQueue:
+    """FIFO queue for fire-and-forget TTS with a single persistent play process.
+
+    One `play` process stays open for the lifetime of the queue, receiving a
+    continuous PCM stream. Items flow seamlessly with no gaps. The worker uses
+    time-based tracking to know when each item's audio has finished playing,
+    keeping queue status accurate.
+
+    Skip kills the play process (next write auto-restarts it).
+    """
+
+    def __init__(self, daemon: "SpeakDaemon"):
+        self.daemon = daemon
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._current: dict | None = None
+        self._play_proc: asyncio.subprocess.Process | None = None
+        self._worker_task: asyncio.Task | None = None
+        self._id_counter = 0
+        self._skip_flag = False
+        self._last_request: dict | None = None  # for replay
+        self._items_played = 0  # track consecutive items for separator tone
+        self._last_caller: str | None = None  # track caller for caller-specific tones
+        self.total_enqueued = 0
+        self.total_completed = 0
+        self.total_skipped = 0
+        self._init_history_db()
+
+    def _init_history_db(self):
+        import sqlite3
+        db_path = f"/tmp/speak-{os.environ['USER']}-history.db"
+        self._history_db = sqlite3.connect(db_path)
+        self._history_db.execute(
+            "CREATE TABLE IF NOT EXISTS history ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  text TEXT NOT NULL,"
+            "  spoken_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+            ")"
+        )
+        self._history_db.commit()
+
+    def record_history(self, text: str):
+        self._history_db.execute("INSERT INTO history (text) VALUES (?)", (text,))
+        self._history_db.commit()
+
+    def get_history(self, n: int = 10) -> list[str]:
+        rows = self._history_db.execute(
+            "SELECT text FROM history ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        return [r[0] for r in reversed(rows)]
+
+    def start(self):
+        self._worker_task = asyncio.create_task(self._worker())
+
+    @property
+    def is_active(self) -> bool:
+        return self._current is not None or not self._queue.empty()
+
+    async def enqueue(self, request: dict) -> int:
+        self._id_counter += 1
+        self.total_enqueued += 1
+        request["_queue_id"] = self._id_counter
+        await self._queue.put(request)
+        self._publish("enqueued", enqueued_id=self._id_counter)
+        return self._queue.qsize()
+
+    async def skip(self) -> dict:
+        """Skip current item by killing ffplay. Next write restarts it."""
+        if self._current:
+            self._skip_flag = True
+            self.total_skipped += 1
+            await self._kill_play_proc(force=True)
+            self._publish("skipped")
+            return {"ok": True, "skipped": self._current.get("text", "")[:80]}
+        return {"ok": False, "error": "nothing playing"}
+
+    async def clear(self) -> dict:
+        count = 0
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                count += 1
+            except asyncio.QueueEmpty:
+                break
+        self._publish("cleared", cleared_count=count)
+        return {"ok": True, "cleared": count}
+
+    async def replay(self) -> dict:
+        """Re-enqueue the last completed item."""
+        if self._last_request is None:
+            return {"ok": False, "error": "nothing to replay"}
+        req = dict(self._last_request)
+        self._id_counter += 1
+        req["_queue_id"] = self._id_counter
+        req["_is_replay"] = True
+        await self._queue.put(req)
+        return {"ok": True, "position": self._queue.qsize(),
+                "text": req.get("text", "")[:80]}
+
+    def status(self) -> dict:
+        pending = []
+        items = list(self._queue._queue)
+        for item in items:
+            pending.append({
+                "id": item.get("_queue_id"),
+                "text": item.get("text", "")[:80],
+            })
+        result = {"pending": len(pending), "items": pending}
+        if self._current:
+            result["playing"] = {
+                "id": self._current.get("_queue_id"),
+                "text": self._current.get("text", "")[:80],
+            }
+        return result
+
+    async def _kill_play_proc(self, force=False):
+        """Shut down ffplay. By default, closes stdin and waits for ffplay
+        to finish playing its buffer (-autoexit handles this). Use force=True
+        to kill immediately (e.g. on skip)."""
+        if self._play_proc and self._play_proc.returncode is None:
+            try:
+                if force:
+                    self._play_proc.kill()
+                else:
+                    self._play_proc.stdin.close()
+                await self._play_proc.wait()
+            except Exception:
+                pass
+            self._play_proc = None
+
+    async def _ensure_play_proc(self):
+        if self._play_proc and self._play_proc.returncode is None:
+            return
+        self._play_proc = await asyncio.create_subprocess_exec(
+            "ffplay", "-nodisp", "-autoexit",
+            "-probesize", "32",
+            "-f", "s16le", "-ar", "24000", "-ch_layout", "mono", "-i", "pipe:0",
+            "-loglevel", "quiet",
+            stdin=asyncio.subprocess.PIPE,
+        )
+
+    # Write PCM in small chunks so ffplay backpressure naturally paces us.
+    # When ffplay's internal buffer (~5s) is full, drain() blocks until it
+    # consumes some audio. This keeps us in sync with actual playback.
+    _WRITE_CHUNK_BYTES = int(SAMPLE_RATE * 2 * 0.25)  # 0.25s of audio per write
+
+    async def _write_pcm(self, pcm: bytes) -> float:
+        """Write PCM to ffplay in small chunks for backpressure pacing.
+        Returns duration in seconds of what was written."""
+        await self._ensure_play_proc()
+        offset = 0
+        while offset < len(pcm) and not self._skip_flag:
+            chunk = pcm[offset:offset + self._WRITE_CHUNK_BYTES]
+            try:
+                self._play_proc.stdin.write(chunk)
+                await self._play_proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                self._play_proc = None
+                await self._ensure_play_proc()
+                self._play_proc.stdin.write(chunk)
+                await self._play_proc.stdin.drain()
+            offset += len(chunk)
+        n_samples = len(pcm) // 2  # int16
+        return n_samples / SAMPLE_RATE
+
+    def _publish(self, event: str, **extra):
+        """Publish state change for external tools."""
+        pending = list(self._queue._queue)
+        state = {
+            "event": event,
+            "playing": None,
+            "pending": len(pending),
+            "queue": [{"id": r.get("_queue_id"), "caller": r.get("caller", ""),
+                       "text": r.get("text", "")[:120]} for r in pending],
+        }
+        if self._current:
+            state["playing"] = {
+                "id": self._current.get("_queue_id"),
+                "caller": self._current.get("caller", ""),
+                "voice": self._current.get("_resolved_voice", ""),
+                "text": self._current.get("text", "")[:120],
+            }
+        state.update(extra)
+        _publish_state(state)
+
+    async def _worker(self):
+        loop = asyncio.get_event_loop()
+        self._publish("idle")
+        while True:
+            request = await self._queue.get()
+            self._current = request
+            self._skip_flag = False
+            try:
+                caller = request.get("caller")
+                # Spacing between items:
+                #   same caller:  [separator_tone]
+                #   diff caller:  [silence gap]  (prev end tone already played)
+                #   no caller:    [separator_tone]
+                if self._items_played > 0:
+                    if caller and caller != self._last_caller:
+                        # Gap after previous caller's end tone
+                        print(f"speak-daemon: [gap] 1.0s silence between {self._last_caller} -> {caller}", file=sys.stderr)
+                        await self._write_pcm(CALLER_GAP)
+                    elif not caller or caller == self._last_caller:
+                        await self._write_pcm(SEPARATOR_TONE)
+
+                # Resolve voice early so state events include it
+                voice_name = request.get("voice", "af_heart")
+                if caller:
+                    voice_name, _ = get_caller_voice(caller, voice_name)
+                request["_resolved_voice"] = voice_name
+
+                # Start tone
+                if caller:
+                    await self._write_pcm(get_caller_tone(caller))
+
+                self._publish("playing")
+
+                # The actual speech
+                await self._play_request(request, loop)
+
+                # End tone
+                if caller:
+                    await self._write_pcm(get_caller_tone(caller))
+
+                self._publish("item_done")
+                self._last_request = request
+                self._last_caller = caller
+                self._items_played += 1
+                self.total_completed += 1
+                # Record in history
+                text = request.get("text", "")
+                if text:
+                    self.record_history(text)
+            except Exception as e:
+                print(f"speak-daemon: queue playback error: {e}", file=sys.stderr)
+            finally:
+                self._current = None
+                self.daemon.last_activity = time.monotonic()
+                # Reset separator counter when queue drains, and kill ffplay
+                # so next batch gets a fresh audio device (handles device changes)
+                if self._queue.empty():
+                    self._items_played = 0
+                    await self._kill_play_proc()
+                    self._publish("idle")
+
+    async def _play_request(self, request: dict, loop):
+        text = request.get("text", "").strip()
+        voice_name = request.get("voice", "af_heart")
+        speed = request.get("speed", 1.0)
+        lang = request.get("lang", "en-us")
+        qid = request.get("_queue_id", "?")
+        caller = request.get("caller", "")
+
+        # Apply caller-specific voice and gain if configured
+        gain = 1.0
+        if caller:
+            voice_name, gain = get_caller_voice(caller, voice_name)
+        request["_resolved_voice"] = voice_name
+
+        if not text:
+            return
+
+        item_t0 = time.monotonic()
+        label = text[:60].replace('\n', ' ')
+        caller_tag = f" caller={caller}" if caller else ""
+        gain_tag = f" gain={gain}" if gain != 1.0 else ""
+        print(f"speak-daemon: [q#{qid}] START  voice={voice_name} speed={speed}{caller_tag}{gain_tag} \"{label}\"", file=sys.stderr)
+
+        voice = self.daemon.kokoro.get_voice_style(voice_name)
+        clauses = split_clauses(text)
+        total_audio_secs = 0
+        total_synth_ms = 0
+
+        for i, sentence in enumerate(clauses):
+            if self._skip_flag:
+                print(f"speak-daemon: [q#{qid}] SKIPPED after {i}/{len(clauses)} clauses", file=sys.stderr)
+                return
+
+            synth_t0 = time.monotonic()
+            pcm, needs_upgrade = await loop.run_in_executor(
+                None, self.daemon._synthesize_sentence,
+                sentence, voice_name, voice, speed, lang,
+            )
+            synth_ms = (time.monotonic() - synth_t0) * 1000
+            total_synth_ms += synth_ms
+
+            if self._skip_flag:
+                print(f"speak-daemon: [q#{qid}] SKIPPED after {i}/{len(clauses)} clauses", file=sys.stderr)
+                return
+
+            # Apply volume gain if needed (e.g. quiet voices like af_nova)
+            if gain != 1.0:
+                samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+                samples = np.clip(samples * gain, -32767, 32767).astype(np.int16)
+                pcm = samples.tobytes()
+
+            write_t0 = time.monotonic()
+            dur = await self._write_pcm(pcm)
+            write_ms = (time.monotonic() - write_t0) * 1000
+            total_audio_secs += dur
+
+            cache_tag = "HIT" if synth_ms < 5 else ("ASM" if needs_upgrade else "SYN")
+            clause_label = sentence[:40].replace('\n', ' ')
+            print(
+                f"speak-daemon: [q#{qid}]   clause {i+1}/{len(clauses)} "
+                f"{cache_tag} synth={synth_ms:.0f}ms write={write_ms:.0f}ms "
+                f"audio={dur:.2f}s speed={speed} \"{clause_label}\"",
+                file=sys.stderr,
+            )
+
+            if needs_upgrade:
+                task = asyncio.create_task(loop.run_in_executor(
+                    None, self.daemon._bg_upgrade,
+                    sentence, voice_name, voice, speed, lang,
+                ))
+                self.daemon._bg_tasks.add(task)
+                task.add_done_callback(self.daemon._bg_tasks.discard)
+
+        # No explicit wait needed — backpressure from chunked writes keeps us
+        # paced with ffplay. By the time all writes complete, most audio has
+        # already played. The persistent stream means the next item flows
+        # seamlessly without any gap.
+        total_ms = (time.monotonic() - item_t0) * 1000
+        proc_alive = self._play_proc and self._play_proc.returncode is None
+        print(
+            f"speak-daemon: [q#{qid}] DONE   "
+            f"total={total_ms:.0f}ms audio={total_audio_secs:.2f}s "
+            f"synth={total_synth_ms:.0f}ms ffplay={'alive' if proc_alive else 'DEAD'}",
+            file=sys.stderr,
+        )
+
+
 class SpeakDaemon:
     def __init__(self, model_path: str, voices_path: str):
         self.kokoro = Kokoro(model_path, voices_path)
+        self.cache = AudioCache(CACHE_DIR, CACHE_TTL_DAYS)
         self.last_activity = time.monotonic()
         self.active_connections = 0
+        self._bg_tasks: set[asyncio.Task] = set()
+        self.start_time = time.time()
+        self.playback_queue = PlaybackQueue(self)
 
-    def _synthesize_sentence(self, sentence, voice, speed):
-        """Synthesize a single sentence (blocking, runs in executor)."""
-        audio, sample_rate = self.kokoro._create_audio(
-            self.kokoro.tokenizer.phonemize(sentence, "en-us"),
-            voice,
-            speed,
-        )
-        return (audio * 32767).astype(np.int16).tobytes()
+    def _phonemize_words(self, text: str, lang: str = "en-us") -> list[str]:
+        """Phonemize each word of text independently. Returns list of phoneme strings."""
+        words = text.split()
+        return [self.kokoro.tokenizer.phonemize(w, lang) for w in words]
+
+    def _synthesize_full(self, text: str, voice_name: str, voice, speed: float, lang: str = "en-us"):
+        """Full synthesis: returns PCM bytes and populates both clause and word caches."""
+        phonemes = self.kokoro.tokenizer.phonemize(text, lang)
+        audio, sr = self.kokoro._create_audio(phonemes, voice, speed)
+        pcm = (audio * 32767).astype(np.int16).tobytes()
+
+        # Populate clause cache
+        self.cache.put_clause(text, voice_name, speed, pcm)
+
+        # Populate word cache by extracting individual words from the full audio
+        word_phonemes = self._phonemize_words(text, lang)
+        if len(word_phonemes) > 1:
+            self.cache.extract_and_cache_words(word_phonemes, audio, voice_name, speed)
+        elif word_phonemes:
+            self.cache.put_word(word_phonemes[0], voice_name, speed, pcm)
+
+        return pcm
+
+    def _synthesize_sentence(self, sentence, voice_name, voice, speed, lang="en-us"):
+        """Synthesize a clause using two-tier cache: clause → word assembly → full synthesis.
+
+        Returns (pcm_bytes, needs_background_upgrade) tuple.
+        needs_background_upgrade is True when we served from word cache and want
+        to do a full synthesis in the background for higher quality next time.
+        """
+        # Tier 1: clause cache (exact match, best quality)
+        cached = self.cache.get_clause(sentence, voice_name, speed)
+        if cached is not None:
+            return cached, False
+
+        # Tier 2: try to assemble from cached words
+        word_phonemes = self._phonemize_words(sentence, lang)
+        assembled = self.cache.assemble_from_words(word_phonemes, voice_name, speed)
+        if assembled is not None:
+            return assembled, True  # serve now, upgrade in background
+
+        # Cache miss on both tiers: full synthesis
+        pcm = self._synthesize_full(sentence, voice_name, voice, speed, lang)
+        return pcm, False
+
+    def _bg_upgrade(self, sentence, voice_name, voice, speed, lang):
+        """Background task: do full synthesis to upgrade word-assembled cache to clause cache."""
+        self._synthesize_full(sentence, voice_name, voice, speed, lang)
+
+    def _send_json(self, writer, obj):
+        """Send a JSON response using the length-prefixed protocol, then zero terminator."""
+        payload = json.dumps(obj).encode()
+        writer.write(struct.pack("!I", len(payload)))
+        writer.write(payload)
+        writer.write(struct.pack("!I", 0))
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.active_connections += 1
@@ -71,6 +854,51 @@ class SpeakDaemon:
             raw_msg = await reader.readexactly(msg_len)
             request = json.loads(raw_msg.decode())
 
+            # --- Queue command dispatch (skip, clear, queue_status) ---
+            command = request.get("command")
+            if command:
+                if command == "skip":
+                    result = await self.playback_queue.skip()
+                elif command == "clear":
+                    result = await self.playback_queue.clear()
+                elif command == "queue_status":
+                    result = self.playback_queue.status()
+                elif command == "replay":
+                    result = await self.playback_queue.replay()
+                elif command == "stats":
+                    q = self.playback_queue
+                    result = {
+                        "daemon": {
+                            "pid": os.getpid(),
+                            "uptime_secs": round(time.time() - self.start_time),
+                            "active_connections": self.active_connections,
+                        },
+                        "queue": {
+                            "total_enqueued": q.total_enqueued,
+                            "total_completed": q.total_completed,
+                            "total_skipped": q.total_skipped,
+                            "pending": q._queue.qsize(),
+                            "playing": q._current.get("text", "")[:80] if q._current else None,
+                        },
+                        "cache": self.cache.stats(),
+                    }
+                elif command == "history":
+                    n = request.get("n", 10)
+                    result = {"ok": True, "entries": self.playback_queue.get_history(n)}
+                else:
+                    result = {"ok": False, "error": f"unknown command: {command}"}
+                self._send_json(writer, result)
+                await writer.drain()
+                return
+
+            # --- Enqueue dispatch (fire-and-forget) ---
+            if request.get("enqueue"):
+                position = await self.playback_queue.enqueue(request)
+                self._send_json(writer, {"ok": True, "position": position})
+                await writer.drain()
+                return
+
+            # --- Original streaming path (unchanged) ---
             text = request.get("text", "").strip()
             voice_name = request.get("voice", "af_heart")
             speed = request.get("speed", 1.0)
@@ -89,12 +917,22 @@ class SpeakDaemon:
             loop = asyncio.get_event_loop()
 
             for sentence in clauses:
-                pcm = await loop.run_in_executor(
-                    None, self._synthesize_sentence, sentence, voice, speed
+                pcm, needs_upgrade = await loop.run_in_executor(
+                    None, self._synthesize_sentence,
+                    sentence, voice_name, voice, speed, lang,
                 )
                 writer.write(struct.pack("!I", len(pcm)))
                 writer.write(pcm)
                 await writer.drain()
+
+                # If we served from word cache, upgrade to clause cache in background
+                if needs_upgrade:
+                    task = asyncio.create_task(loop.run_in_executor(
+                        None, self._bg_upgrade,
+                        sentence, voice_name, voice, speed, lang,
+                    ))
+                    self._bg_tasks.add(task)
+                    task.add_done_callback(self._bg_tasks.discard)
 
             # Signal end of stream with zero-length chunk
             writer.write(struct.pack("!I", 0))
@@ -112,13 +950,20 @@ class SpeakDaemon:
                 pass
 
     async def idle_watchdog(self):
-        """Shut down if idle for IDLE_TIMEOUT seconds."""
+        """Shut down if idle for IDLE_TIMEOUT seconds. Evict expired cache periodically."""
+        evict_interval = 3600  # check once per hour
+        last_evict = time.monotonic()
         while True:
             await asyncio.sleep(30)
             idle_for = time.monotonic() - self.last_activity
-            if self.active_connections == 0 and idle_for >= IDLE_TIMEOUT:
+            if self.active_connections == 0 and idle_for >= IDLE_TIMEOUT and not self.playback_queue.is_active:
                 print(f"speak-daemon: idle for {IDLE_TIMEOUT}s, shutting down", file=sys.stderr)
                 cleanup_and_exit()
+            if time.monotonic() - last_evict > evict_interval:
+                removed = self.cache.evict_expired()
+                if removed:
+                    print(f"speak-daemon: evicted {removed} expired cache entries", file=sys.stderr)
+                last_evict = time.monotonic()
 
     async def run(self):
         # Clean up stale socket
@@ -133,8 +978,15 @@ class SpeakDaemon:
         with open(pid_path, "w") as f:
             f.write(str(os.getpid()))
 
-        print(f"speak-daemon: listening on {SOCKET_PATH} (pid {os.getpid()})", file=sys.stderr)
+        s = self.cache.stats()
+        print(
+            f"speak-daemon: listening on {SOCKET_PATH} (pid {os.getpid()})\n"
+            f"  cache: {s['clauses']} clauses ({s['clause_hits']} hits), "
+            f"{s['words']} words ({s['word_hits']} hits), TTL={CACHE_TTL_DAYS}d",
+            file=sys.stderr,
+        )
 
+        self.playback_queue.start()
         asyncio.create_task(self.idle_watchdog())
 
         async with server:
@@ -166,7 +1018,16 @@ def main():
 
     print("speak-daemon: loading model...", file=sys.stderr)
     daemon = SpeakDaemon(args.model, args.voices)
-    print("speak-daemon: model loaded, ready.", file=sys.stderr)
+    s = daemon.cache.stats()
+    print(
+        f"speak-daemon: model loaded, ready. cache={CACHE_DIR}\n"
+        f"  {s['clauses']} clauses ({s['clause_hits']} hits), "
+        f"{s['words']} words ({s['word_hits']} hits), TTL={CACHE_TTL_DAYS}d",
+        file=sys.stderr,
+    )
+    if s["voices"]:
+        for v, vs in sorted(s["voices"].items()):
+            print(f"    {v}: {vs['clauses']}c/{vs['words']}w, {vs['hits']} hits", file=sys.stderr)
 
     asyncio.run(daemon.run())
 
