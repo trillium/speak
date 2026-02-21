@@ -21,7 +21,24 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "..", "config", "rewrites.json")
 REVIEW_PATH = os.path.join(SCRIPT_DIR, "..", "config", "rewrites-review.json")
+FLAGGED_PATH = os.path.join(SCRIPT_DIR, "..", "config", "flagged.json")
 SPEAK = os.path.join(SCRIPT_DIR, "speak")
+
+
+def auto_unflag(word):
+    """Remove a word/phrase from the flagged list if present."""
+    try:
+        with open(FLAGGED_PATH) as f:
+            flagged = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    before = len(flagged)
+    flagged = [e for e in flagged if e.get("text", "").lower() != word.lower()]
+    if len(flagged) < before:
+        with open(FLAGGED_PATH, "w") as f:
+            json.dump(flagged, f, indent=2)
+            f.write("\n")
+        print(f"  (auto-unflagged: {word})")
 
 
 def load_json(path):
@@ -123,6 +140,7 @@ def cmd_accept(config, review, key):
         "reviewed_at": time.time(),
     }
     save_json(REVIEW_PATH, review)
+    auto_unflag(word)
     print(f"✓ Accepted: {word} → {value}")
 
 
@@ -169,6 +187,7 @@ def cmd_unnecessary(config, review, key):
         "reviewed_at": time.time(),
     }
     save_json(REVIEW_PATH, review)
+    auto_unflag(word)
     print(f"⊘ Unnecessary: {word} → {value} (removed from rewrites)")
 
 
@@ -192,6 +211,7 @@ def cmd_fix(config, review, key, new_value):
         "rejected_alts": rejected_alts,
     }
     save_json(REVIEW_PATH, review)
+    auto_unflag(word)
     print(f"Fixed: {word} → {new_value}  (was: {old_value})")
     if section == "pronunciation":
         speak(f"{word} becomes {new_value}")
