@@ -191,11 +191,12 @@ def cmd_unnecessary(config, review, key):
     print(f"⊘ Unnecessary: {word} → {value} (removed from rewrites)")
 
 
-def cmd_fix(config, review, key, new_value):
+def _fix_one(config, review, key, new_value):
+    """Fix a single rewrite entry."""
     found = find_entry(config, key)
     if not found:
         print(f"No rewrite found matching '{key}'")
-        sys.exit(1)
+        return False
     section, word, old_value = found
     config[section][word] = new_value
     save_json(CONFIG_PATH, config)
@@ -213,13 +214,30 @@ def cmd_fix(config, review, key, new_value):
     save_json(REVIEW_PATH, review)
     auto_unflag(word)
     print(f"Fixed: {word} → {new_value}  (was: {old_value})")
-    if section == "pronunciation":
-        speak(f"{word} becomes {new_value}")
-    else:
-        if new_value:
-            speak(f"The phrase {word} will be replaced with {new_value}")
-        else:
-            speak(f"The phrase {word} will be removed")
+    return True
+
+
+def cmd_fix(config, review, key, new_value):
+    """Fix one or more rewrites. Accepts comma-separated key=value pairs.
+
+    Single:   fix anymore "any more"
+    Multiple: fix "anymore=any more, exactly right=correct"
+    """
+    # Check if the key contains comma-separated pairs (batch mode)
+    combined = key if "=" in key else f"{key}={new_value}"
+    pairs = [p.strip() for p in combined.split(",") if p.strip()]
+    errors = 0
+    for pair in pairs:
+        if "=" not in pair:
+            print(f"Invalid pair (missing =): {pair}")
+            errors += 1
+            continue
+        k, v = pair.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not _fix_one(config, review, k, v):
+            errors += 1
+    if errors:
+        sys.exit(1)
 
 
 def cmd_test(config, key):
@@ -449,10 +467,17 @@ def main():
         cmd_reject(config, review, " ".join(sys.argv[2:]))
     elif cmd == "unnecessary" and len(sys.argv) >= 3:
         cmd_unnecessary(config, review, " ".join(sys.argv[2:]))
-    elif cmd == "fix" and len(sys.argv) >= 4:
-        # Everything after the key is the new value — need to split key from value.
-        # Key is argv[2], value is the rest joined.
-        cmd_fix(config, review, sys.argv[2], " ".join(sys.argv[3:]))
+    elif cmd == "fix" and len(sys.argv) >= 3:
+        # Batch mode: fix "key=val, key=val" (single arg with commas/equals)
+        # Single mode: fix key value (key is argv[2], value is rest)
+        rest = " ".join(sys.argv[2:])
+        if "=" in sys.argv[2]:
+            cmd_fix(config, review, rest, "")
+        elif len(sys.argv) >= 4:
+            cmd_fix(config, review, sys.argv[2], " ".join(sys.argv[3:]))
+        else:
+            print("Usage: fix KEY VALUE  or  fix \"key=value, key=value\"")
+            sys.exit(1)
     elif cmd == "test" and len(sys.argv) >= 3:
         cmd_test(config, " ".join(sys.argv[2:]))
     elif cmd == "test-all":

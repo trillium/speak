@@ -192,19 +192,26 @@ while [[ $# -gt 0 ]]; do
             ;;
         --flag)
             shift
-            _flag_phrase="$*"
-            if [[ -z "${_flag_phrase}" ]]; then
+            _flag_input="$*"
+            if [[ -z "${_flag_input}" ]]; then
                 echo "speak: --flag requires a word or phrase" >&2; exit 1
             fi
             if [[ ! -f "${FLAGGED_FILE}" ]]; then
                 echo '[]' > "${FLAGGED_FILE}"
             fi
             _flag_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            _flag_tmp="$(mktemp)"
-            jq --arg w "${_flag_phrase}" --arg t "${_flag_ts}" \
-                '. + [{"text": $w, "flagged_at": $t}]' "${FLAGGED_FILE}" > "${_flag_tmp}" \
-                && mv "${_flag_tmp}" "${FLAGGED_FILE}"
-            echo "Flagged: ${_flag_phrase}"
+            # Split on commas, trim whitespace, flag each entry
+            IFS=',' read -ra _flag_entries <<< "${_flag_input}"
+            for _flag_entry in "${_flag_entries[@]}"; do
+                # Trim leading/trailing whitespace
+                _flag_phrase="$(echo "${_flag_entry}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                if [[ -z "${_flag_phrase}" ]]; then continue; fi
+                _flag_tmp="$(mktemp)"
+                jq --arg w "${_flag_phrase}" --arg t "${_flag_ts}" \
+                    '. + [{"text": $w, "flagged_at": $t}]' "${FLAGGED_FILE}" > "${_flag_tmp}" \
+                    && mv "${_flag_tmp}" "${FLAGGED_FILE}"
+                echo "Flagged: ${_flag_phrase}"
+            done
             exit 0
             ;;
         --flagged)
