@@ -45,6 +45,10 @@ class FFPlayStream:
             "-loglevel", "quiet",
             stdin=asyncio.subprocess.PIPE,
         )
+        # Prime ffplay with silence so it finishes probing before real audio
+        prime = b"\x00" * (SAMPLE_RATE * 2 // 10)  # 100ms silence
+        self._proc.stdin.write(prime)
+        await self._proc.stdin.drain()
 
     async def write_pcm(self, pcm: bytes, skip_flag_fn=None) -> float:
         """Write PCM to ffplay in small chunks for backpressure pacing.
