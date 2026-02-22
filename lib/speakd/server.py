@@ -17,6 +17,7 @@ from .playback import PlaybackQueue
 from .protocol import send_json
 from .synthesis import SynthesisEngine
 from .text import split_clauses
+from .voice_pool import VoicePool
 
 
 class SpeakDaemon:
@@ -28,10 +29,14 @@ class SpeakDaemon:
         self.active_connections = 0
         self._bg_tasks: set[asyncio.Future] = set()
         self.start_time = time.time()
+        config_dir = os.path.join(os.path.dirname(__file__), "..", "..", "config")
+        voice_config = os.path.join(config_dir, "voices.json")
+        self.voice_pool = VoicePool(voice_config)
         self.playback_queue = PlaybackQueue(
             synth=self.synth,
             on_activity=self._touch_activity,
             bg_task_tracker=self._track_bg_task,
+            voice_pool=self.voice_pool,
         )
 
     def _touch_activity(self):
@@ -79,6 +84,8 @@ class SpeakDaemon:
                         },
                         "cache": self.cache.stats(),
                     }
+                elif command == "voice_pool_status":
+                    result = {"ok": True, **self.voice_pool.status()}
                 elif command == "history":
                     n = request.get("n", 10)
                     result = {"ok": True, "entries": self.playback_queue.get_history(n)}

@@ -21,8 +21,8 @@ from .tones import (
     CALLER_GAP,
     SEPARATOR_TONE,
     get_caller_tone,
-    get_caller_voice,
 )
+from .voice_pool import VoicePool
 
 
 class PlaybackQueue:
@@ -33,10 +33,12 @@ class PlaybackQueue:
         synth: SynthesisEngine,
         on_activity: Callable[[], None],
         bg_task_tracker: Callable[[asyncio.Task], None],
+        voice_pool: VoicePool | None = None,
     ):
         self.synth = synth
         self._on_activity = on_activity
         self._bg_task_tracker = bg_task_tracker
+        self.voice_pool = voice_pool
         self._queue: asyncio.Queue = asyncio.Queue()
         self._current: dict | None = None
         self._ffplay = AudioOutputStream()
@@ -162,15 +164,36 @@ class PlaybackQueue:
                     elif not caller or caller == self._last_caller:
                         await self._ffplay.write_pcm(SEPARATOR_TONE)
 
-                # Resolve voice early so state events include it
+                # Resolve voice via pool (caller+session) or use request default
                 voice_name = request.get("voice", "af_heart")
-                if caller:
-                    voice_name, _ = get_caller_voice(caller, voice_name)
+                session = request.get("session", "")
+                is_new_claim = False
+                gain = 1.0
+                if caller and self.voice_pool:
+                    voice_name, gain, is_new_claim = self.voice_pool.get_voice(
+                        caller, session, voice_name
+                    )
                 request["_resolved_voice"] = voice_name
+                request["_gain"] = gain
 
                 # Start tone
                 if caller:
                     await self._ffplay.write_pcm(get_caller_tone(caller))
+
+                # Announce new voice assignment
+                if is_new_claim and caller:
+                    import numpy as np
+                    announce_text = f"{caller} here"
+                    async for audio, sr in self.synth.kokoro.create_stream(
+                        announce_text, voice_name, 1.26, "en-us", trim=False
+                    ):
+                        audio = audio.squeeze()
+                        pcm_samples = (audio * 32767).astype(np.int16)
+                        if gain != 1.0:
+                            pcm_samples = np.clip(
+                                pcm_samples.astype(np.float32) * gain, -32767, 32767
+                            ).astype(np.int16)
+                        await self._ffplay.write_pcm(pcm_samples.tobytes())
 
                 self._publish("playing")
 

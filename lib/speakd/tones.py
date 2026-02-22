@@ -102,18 +102,3 @@ def get_caller_tone(caller: str) -> bytes:
         _caller_tone_cache[caller] = _generate_caller_tone(caller)
     return _caller_tone_cache[caller]
 
-
-# Voice assignments per caller. Callers not listed use the request's voice.
-# This can be overridden via a config file in the future.
-# Map caller names to (voice, gain) tuples.
-# Gain 1.0 = no change, >1.0 = louder. Adjust per voice to normalize volume.
-CALLER_VOICES: dict[str, tuple[str, float]] = {
-    "speak": ("af_heart", 1.0),
-    "happy": ("am_adam", 1.0),
-    "ops":   ("af_nova", 1.5),     # nova is quiet by default
-}
-
-
-def get_caller_voice(caller: str, default_voice: str) -> tuple[str, float]:
-    """Return (voice_name, gain) for a caller."""
-    return CALLER_VOICES.get(caller, (default_voice, 1.0))

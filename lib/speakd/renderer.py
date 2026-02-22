@@ -14,7 +14,6 @@ import numpy as np
 from .config import SAMPLE_RATE
 from .playback_device import AudioOutputStream
 from .protocol import log_event
-from .tones import get_caller_voice
 
 
 async def render_speech(
@@ -38,10 +37,9 @@ async def render_speech(
     qid = request.get("_queue_id", "?")
     caller = request.get("caller", "")
 
-    gain = 1.0
-    if caller:
-        voice_name, gain = get_caller_voice(caller, voice_name)
-    request["_resolved_voice"] = voice_name
+    # Voice and gain already resolved by playback.py via VoicePool
+    voice_name = request.get("_resolved_voice", voice_name)
+    gain = request.get("_gain", 1.0)
 
     if not text:
         return
