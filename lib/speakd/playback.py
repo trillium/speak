@@ -53,11 +53,17 @@ class PlaybackQueue:
         self.total_skipped = 0
         self._history = SpeechHistory()
 
-    def record_history(self, text: str):
-        self._history.record(text)
+    def record_history(self, text: str, caller: str = "", session: str = ""):
+        self._history.record(text, caller=caller, session=session)
 
     def get_history(self, n: int = 10) -> list[str]:
         return self._history.get(n)
+
+    def get_history_by_session(self, session: str, n: int = 10) -> list[str]:
+        return self._history.get_by_session(session, n)
+
+    def get_history_by_caller(self, caller: str, n: int = 10) -> list[str]:
+        return self._history.get_by_caller(caller, n)
 
     def start(self):
         self._worker_task = asyncio.create_task(self._worker())
@@ -216,7 +222,11 @@ class PlaybackQueue:
                 # Record in history
                 text = request.get("text", "")
                 if text:
-                    self.record_history(text)
+                    self.record_history(
+                        text,
+                        caller=request.get("caller", ""),
+                        session=request.get("session", ""),
+                    )
             except Exception as e:
                 print(f"speak-daemon: queue playback error: {e}", file=sys.stderr)
             finally:

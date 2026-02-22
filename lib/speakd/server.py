@@ -96,6 +96,14 @@ class SpeakDaemon:
                 elif command == "history":
                     n = request.get("n", 10)
                     result = {"ok": True, "entries": self.playback_queue.get_history(n)}
+                elif command == "session_history":
+                    session = request.get("session", "")
+                    n = request.get("n", 10)
+                    result = {"ok": True, "entries": self.playback_queue.get_history_by_session(session, n)}
+                elif command == "caller_history":
+                    caller = request.get("caller", "")
+                    n = request.get("n", 10)
+                    result = {"ok": True, "entries": self.playback_queue.get_history_by_caller(caller, n)}
                 else:
                     result = {"ok": False, "error": f"unknown command: {command}"}
                 send_json(writer, result)

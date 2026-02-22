@@ -79,6 +79,8 @@ Options:
   --stats           Show daemon stats (uptime, cache, queue totals)
   --caller NAME     Caller identity (plays a unique tone per caller)
   --history [N]     Show last N spoken texts as JSON array (default: 10)
+  --agent-summary PID  Summarize what a Claude Code session (by PID) has said
+  --agent-repeat PID [N]  Replay last N things a session said (default: 3)
   --flag WORD/PHRASE  Flag a word or phrase that sounds wrong (triage later)
   --flagged         Show all flagged words/phrases
   --unflag WORD     Remove a word/phrase from the flagged list
@@ -229,6 +231,26 @@ while [[ $# -gt 0 ]]; do
                 HISTORY_N=10
             fi
             QUEUE_CMD="history"
+            ;;
+        --agent-summary)
+            AGENT_SUMMARY_PID="${2:-}"
+            if [[ -z "${AGENT_SUMMARY_PID}" ]]; then
+                echo "speak: --agent-summary requires a PID" >&2; exit 1
+            fi
+            shift 2
+            ;;
+        --agent-repeat)
+            AGENT_REPEAT_PID="${2:-}"
+            if [[ -z "${AGENT_REPEAT_PID}" ]]; then
+                echo "speak: --agent-repeat requires a PID" >&2; exit 1
+            fi
+            shift 2
+            AGENT_REPEAT_N="${1:-3}"
+            if [[ $# -gt 0 && "${AGENT_REPEAT_N}" =~ ^[0-9]+$ ]]; then
+                shift
+            else
+                AGENT_REPEAT_N=3
+            fi
             ;;
         --flag)
             shift
@@ -521,6 +543,76 @@ sock.close()
 "
     else
         python3 "${SCRIPT_DIR}/speak-client" --command "${QUEUE_CMD}"
+    fi
+    exit 0
+fi
+
+# --- Handle --agent-summary ---
+if [[ -n "${AGENT_SUMMARY_PID:-}" ]]; then
+    if ! daemon_is_running; then
+        echo "speak: daemon not running (start with: speak --daemon)" >&2
+        exit 1
+    fi
+    # Query session history from daemon
+    _agent_entries="$(python3 -c "
+import socket, struct, json, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+msg = json.dumps({'command': 'session_history', 'session': '${AGENT_SUMMARY_PID}', 'n': 50}).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = sock.recv(resp_len)
+    resp = json.loads(data)
+    entries = resp.get('entries', [])
+    print('\n'.join(entries))
+sock.close()
+")"
+    if [[ -z "${_agent_entries}" ]]; then
+        "${SCRIPT_DIR}/speak" --enqueue "No history found for session ${AGENT_SUMMARY_PID}."
+    else
+        _summary="$(printf '%s' "${_agent_entries}" | "${SCRIPT_DIR}/summarize" --max-words 40)"
+        if [[ -n "${_summary}" ]]; then
+            "${SCRIPT_DIR}/speak" --enqueue "${_summary}"
+        else
+            "${SCRIPT_DIR}/speak" --enqueue "Could not summarize session history."
+        fi
+    fi
+    exit 0
+fi
+
+# --- Handle --agent-repeat ---
+if [[ -n "${AGENT_REPEAT_PID:-}" ]]; then
+    if ! daemon_is_running; then
+        echo "speak: daemon not running (start with: speak --daemon)" >&2
+        exit 1
+    fi
+    # Query session history from daemon
+    _agent_lines="$(python3 -c "
+import socket, struct, json, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+msg = json.dumps({'command': 'session_history', 'session': '${AGENT_REPEAT_PID}', 'n': ${AGENT_REPEAT_N}}).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = sock.recv(resp_len)
+    resp = json.loads(data)
+    entries = resp.get('entries', [])
+    for entry in entries:
+        print(entry)
+sock.close()
+")"
+    if [[ -z "${_agent_lines}" ]]; then
+        "${SCRIPT_DIR}/speak" --enqueue "No history found for session ${AGENT_REPEAT_PID}."
+    else
+        while IFS= read -r _line; do
+            "${SCRIPT_DIR}/speak" --enqueue "${_line}"
+        done <<< "${_agent_lines}"
     fi
     exit 0
 fi
