@@ -11,10 +11,11 @@ use IO::Socket::UNIX;
 use Getopt::Std;
 
 my %opts;
-getopts('v:s:c:', \%opts);
-my $voice  = $opts{v} || 'af_heart';
-my $speed  = $opts{s} || '1.26';
-my $caller = $opts{c} || '';
+getopts('v:s:c:S:', \%opts);
+my $voice   = $opts{v} || 'af_heart';
+my $speed   = $opts{s} || '1.26';
+my $caller  = $opts{c} || '';
+my $session = $opts{S} || getppid();
 
 # Collect text from args or stdin
 my $text;
@@ -38,7 +39,7 @@ $text =~ s/\t/\\t/g;
 
 # Build JSON
 my $caller_field = $caller ? qq(,"caller":"$caller") : '';
-my $msg = qq({"enqueue":true,"text":"$text","voice":"$voice","speed":$speed$caller_field});
+my $msg = qq({"enqueue":true,"text":"$text","voice":"$voice","speed":$speed$caller_field,"session":"$session"});
 
 # Connect to daemon
 my $sock_path = $ENV{SPEAK_SOCK} || "/tmp/speak-$ENV{USER}.sock";

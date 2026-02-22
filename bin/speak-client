@@ -43,6 +43,8 @@ def main():
                         help="Enqueue text for playback and return immediately")
     parser.add_argument("--caller", default="",
                         help="Caller identity for distinct audio tones")
+    parser.add_argument("--session", default=str(os.getppid()),
+                        help="Session ID for voice pool (default: PPID)")
     parser.add_argument("--command",
                         help="Send a queue command (queue_status, skip, clear, replay)")
     args = parser.parse_args()
@@ -73,6 +75,7 @@ def main():
             "voice": args.voice,
             "speed": args.speed,
             "lang": args.lang,
+            "session": args.session,
         }
         if args.caller:
             req["caller"] = args.caller

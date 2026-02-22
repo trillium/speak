@@ -31,6 +31,30 @@ _auto_detect_caller() {
     fi
 }
 
+# Find the Claude Code ancestor PID to use as session identity.
+# All subagents within one Claude Code session share the same ancestor.
+# Falls back to PPID if no Claude Code ancestor is found.
+_detect_session() {
+    local pid="$$"
+    local parent
+    # Walk up the process tree looking for a "claude" process
+    for _ in 1 2 3 4 5 6 7 8; do
+        parent="$(ps -o ppid= -p "${pid}" 2>/dev/null | tr -d ' ')"
+        [[ -z "${parent}" || "${parent}" == "0" || "${parent}" == "1" ]] && break
+        local comm
+        comm="$(ps -o comm= -p "${parent}" 2>/dev/null)"
+        if [[ "${comm}" == *"/claude" || "${comm}" == "claude" ]]; then
+            echo "${parent}"
+            return
+        fi
+        pid="${parent}"
+    done
+    # Fallback: use PPID
+    echo "${PPID}"
+}
+
+SESSION=""
+
 usage() {
     cat <<'EOF'
 Usage: speak [OPTIONS] [TEXT...]
@@ -60,6 +84,10 @@ Options:
   --unflag WORD     Remove a word/phrase from the flagged list
   --mute            Mute audio mode (speak commands will fail fast)
   --unmute          Unmute audio mode
+  --voice-lock NAME VOICE  Lock a caller name to a specific voice
+  --voice-unlock NAME      Unlock a caller name
+  --voice-locks            List all locked voice assignments
+  --voice-pool             Show current pool status (locks + session claims)
   --rewrites CMD    Manage pronunciation/phrase rewrites:
                       list            Show all rewrites with review status
                       pending         Show unreviewed entries
@@ -243,6 +271,48 @@ while [[ $# -gt 0 ]]; do
             echo "Unflagged: ${_flag_phrase}"
             exit 0
             ;;
+        --voice-lock)
+            _vl_name="${2:-}"
+            _vl_voice="${3:-}"
+            if [[ -z "${_vl_name}" || -z "${_vl_voice}" ]]; then
+                echo "speak: --voice-lock requires NAME VOICE" >&2; exit 1
+            fi
+            _vl_file="${SCRIPT_DIR}/../config/voices.json"
+            if [[ ! -f "${_vl_file}" ]]; then
+                echo '{"locks":{}}' > "${_vl_file}"
+            fi
+            _vl_tmp="$(mktemp)"
+            jq --arg n "${_vl_name}" --arg v "${_vl_voice}" \
+                '.locks[$n] = {"voice": $v, "gain": 1.0}' "${_vl_file}" > "${_vl_tmp}" \
+                && mv "${_vl_tmp}" "${_vl_file}"
+            echo "Locked ${_vl_name} to ${_vl_voice}"
+            exit 0
+            ;;
+        --voice-unlock)
+            _vu_name="${2:-}"
+            if [[ -z "${_vu_name}" ]]; then
+                echo "speak: --voice-unlock requires NAME" >&2; exit 1
+            fi
+            _vu_file="${SCRIPT_DIR}/../config/voices.json"
+            if [[ -f "${_vu_file}" ]]; then
+                _vu_tmp="$(mktemp)"
+                jq --arg n "${_vu_name}" 'del(.locks[$n])' "${_vu_file}" > "${_vu_tmp}" \
+                    && mv "${_vu_tmp}" "${_vu_file}"
+            fi
+            echo "Unlocked ${_vu_name}"
+            exit 0
+            ;;
+        --voice-locks)
+            _vl_file="${SCRIPT_DIR}/../config/voices.json"
+            if [[ ! -f "${_vl_file}" ]] || [[ "$(jq '.locks | length' "${_vl_file}")" == "0" ]]; then
+                echo "No voice locks."
+            else
+                jq -r '.locks | to_entries[] | "\(.key)  →  \(.value.voice)  (gain: \(.value.gain))"' "${_vl_file}"
+            fi
+            exit 0
+            ;;
+        --voice-pool)
+            QUEUE_CMD="voice_pool_status"; shift ;;
         --rewrites)   python3 "${SCRIPT_DIR}/speak-test-rewrites" "${@:2}"; exit $? ;;
         --mute)       touch "${MUTE_FILE}"; echo "speak: audio mode muted" >&2; exit 0 ;;
         --unmute)     rm -f "${MUTE_FILE}"; echo "speak: audio mode unmuted" >&2; exit 0 ;;
@@ -364,6 +434,11 @@ speak_kokoro() {
         # Auto-detect caller if not explicitly set
         _auto_detect_caller
 
+        # Detect session (Claude Code ancestor PID or PPID fallback)
+        if [[ -z "${SESSION}" ]]; then
+            SESSION="$(_detect_session)"
+        fi
+
         # Resolve backend: auto picks fastest available
         local backend="${ENQUEUE_BACKEND}"
         if [[ "${backend}" == "auto" ]]; then
@@ -383,7 +458,7 @@ speak_kokoro() {
                     caller_flag=(-c "${CALLER}")
                 fi
                 printf '%s' "${TEXT}" | "${SCRIPT_DIR}/speak-enqueue" \
-                    -v "${VOICE}" -s "${SPEED}" "${caller_flag[@]}"
+                    -v "${VOICE}" -s "${SPEED}" -S "${SESSION}" "${caller_flag[@]}"
                 ;;
             perl)
                 local caller_flag=()
@@ -391,7 +466,7 @@ speak_kokoro() {
                     caller_flag=(-c "${CALLER}")
                 fi
                 printf '%s' "${TEXT}" | "${SCRIPT_DIR}/speak-enqueue-perl" \
-                    -v "${VOICE}" -s "${SPEED}" "${caller_flag[@]}"
+                    -v "${VOICE}" -s "${SPEED}" -S "${SESSION}" "${caller_flag[@]}"
                 ;;
             python)
                 local caller_flag=()
@@ -399,7 +474,8 @@ speak_kokoro() {
                     caller_flag=(--caller "${CALLER}")
                 fi
                 printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
-                    --enqueue --voice "${VOICE}" --speed "${SPEED}" "${caller_flag[@]}"
+                    --enqueue --voice "${VOICE}" --speed "${SPEED}" \
+                    --session "${SESSION}" "${caller_flag[@]}"
                 ;;
             *)
                 echo "speak: unknown enqueue backend '${backend}' (use c, perl, or python)" >&2

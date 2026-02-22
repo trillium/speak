@@ -47,17 +47,23 @@ static int json_escape(const char *src, char *dst, int dstlen) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *voice = "af_heart", *speed = "1.26", *caller = NULL;
+    const char *voice = "af_heart", *speed = "1.26", *caller = NULL, *session = NULL;
+    char ppid_buf[32];
     int opt;
-    while ((opt = getopt(argc, argv, "v:s:c:")) != -1) {
+    while ((opt = getopt(argc, argv, "v:s:c:S:")) != -1) {
         switch (opt) {
             case 'v': voice = optarg; break;
             case 's': speed = optarg; break;
             case 'c': caller = optarg; break;
+            case 'S': session = optarg; break;
             default:
-                fprintf(stderr, "Usage: speak-enqueue [-v voice] [-s speed] [-c caller] TEXT...\n");
+                fprintf(stderr, "Usage: speak-enqueue [-v voice] [-s speed] [-c caller] [-S session] TEXT...\n");
                 return 1;
         }
+    }
+    if (!session) {
+        snprintf(ppid_buf, sizeof(ppid_buf), "%d", getppid());
+        session = ppid_buf;
     }
 
     char text[MAX_TEXT];
@@ -90,12 +96,12 @@ int main(int argc, char *argv[]) {
     int json_len;
     if (caller && caller[0])
         json_len = snprintf(json, sizeof(json),
-            "{\"enqueue\":true,\"text\":\"%s\",\"voice\":\"%s\",\"speed\":%s,\"caller\":\"%s\"}",
-            escaped, voice, speed, caller);
+            "{\"enqueue\":true,\"text\":\"%s\",\"voice\":\"%s\",\"speed\":%s,\"caller\":\"%s\",\"session\":\"%s\"}",
+            escaped, voice, speed, caller, session);
     else
         json_len = snprintf(json, sizeof(json),
-            "{\"enqueue\":true,\"text\":\"%s\",\"voice\":\"%s\",\"speed\":%s}",
-            escaped, voice, speed);
+            "{\"enqueue\":true,\"text\":\"%s\",\"voice\":\"%s\",\"speed\":%s,\"session\":\"%s\"}",
+            escaped, voice, speed, session);
 
     /* connect to daemon */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
