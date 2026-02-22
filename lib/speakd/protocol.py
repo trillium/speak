@@ -1,11 +1,11 @@
-"""Wire protocol helpers: length-prefixed JSON and state publishing."""
+"""Wire protocol helpers: length-prefixed JSON, state publishing, and event log."""
 
 import json
 import os
 import struct
 import time
 
-from .config import STATE_PATH
+from .config import EVENT_LOG_PATH, STATE_PATH
 
 
 def send_json(writer, obj: dict) -> None:
@@ -24,5 +24,16 @@ def publish_state(state: dict) -> None:
         with open(tmp, "w") as f:
             json.dump(state, f)
         os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass
+
+
+def log_event(event: str, **data) -> None:
+    """Append a structured JSONL event to the event log."""
+    entry = {"ts": time.monotonic(), "wall": time.time(), "event": event}
+    entry.update(data)
+    try:
+        with open(EVENT_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
     except OSError:
         pass

@@ -17,6 +17,9 @@ CACHE_DIR = pathlib.Path(os.environ.get(
 ))
 CACHE_TTL_DAYS = int(os.environ.get("SPEAK_CACHE_TTL_DAYS", "3"))
 
+# --- Event log ---
+EVENT_LOG_PATH = f"/tmp/speak-{os.environ['USER']}.events.jsonl"
+
 # --- Audio ---
 SAMPLE_RATE = 24000
 CROSSFADE_MS = 5          # crossfade ramp at word joins (avoids clicks)
