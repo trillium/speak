@@ -1,4 +1,8 @@
-"""Clause-by-clause speech rendering: synthesis, gain, and playback pacing."""
+"""Clause-by-clause speech rendering with pipelined synthesis and playback.
+
+Uses a producer/consumer pattern: synthesis runs ahead of playback so
+the next clause is ready before the current one finishes playing.
+"""
 
 import asyncio
 import sys
@@ -11,6 +15,11 @@ from .synthesis import SynthesisEngine
 from .text import split_clauses
 from .tones import get_caller_voice
 
+# Pre-synthesize up to 2 clauses ahead of playback
+_PIPELINE_DEPTH = 2
+
+_DONE = object()
+
 
 async def render_speech(
     request: dict,
@@ -22,8 +31,8 @@ async def render_speech(
 ) -> None:
     """Synthesize and stream a full speech request clause by clause.
 
-    Handles caller voice resolution, per-clause synthesis with cache,
-    volume gain, and background cache upgrades.
+    Runs synthesis and playback concurrently: while one clause plays
+    through ffplay, the next clause(s) are already being synthesized.
     """
     text = request.get("text", "").strip()
     voice_name = request.get("voice", "af_heart")
@@ -32,7 +41,6 @@ async def render_speech(
     qid = request.get("_queue_id", "?")
     caller = request.get("caller", "")
 
-    # Apply caller-specific voice and gain if configured
     gain = 1.0
     if caller:
         voice_name, gain = get_caller_voice(caller, voice_name)
@@ -49,62 +57,85 @@ async def render_speech(
 
     voice = synth.kokoro.get_voice_style(voice_name)
     clauses = split_clauses(text)
-    total_audio_secs = 0
-    total_synth_ms = 0
+    n_clauses = len(clauses)
 
-    for i, sentence in enumerate(clauses):
-        if skip_flag_fn():
-            print(f"speak-daemon: [q#{qid}] SKIPPED after {i}/{len(clauses)} clauses", file=sys.stderr)
-            return
+    stats = {"total_synth_ms": 0.0, "total_audio_secs": 0.0, "clauses_done": 0}
 
-        synth_t0 = time.monotonic()
-        pcm, needs_upgrade = await loop.run_in_executor(
-            None, synth.synthesize_sentence,
-            sentence, voice_name, voice, speed, lang,
-        )
-        synth_ms = (time.monotonic() - synth_t0) * 1000
-        total_synth_ms += synth_ms
+    pipe = asyncio.Queue(maxsize=_PIPELINE_DEPTH)
 
-        if skip_flag_fn():
-            print(f"speak-daemon: [q#{qid}] SKIPPED after {i}/{len(clauses)} clauses", file=sys.stderr)
-            return
+    async def producer():
+        """Synthesize clauses and feed PCM into the pipeline queue."""
+        for i, sentence in enumerate(clauses):
+            if skip_flag_fn():
+                break
 
-        # Apply volume gain if needed (e.g. quiet voices like af_nova)
-        if gain != 1.0:
-            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-            samples = np.clip(samples * gain, -32767, 32767).astype(np.int16)
-            pcm = samples.tobytes()
-
-        write_t0 = time.monotonic()
-        dur = await ffplay.write_pcm(pcm, skip_flag_fn=skip_flag_fn)
-        write_ms = (time.monotonic() - write_t0) * 1000
-        total_audio_secs += dur
-
-        cache_tag = "HIT" if synth_ms < 5 else ("ASM" if needs_upgrade else "SYN")
-        clause_label = sentence[:40].replace('\n', ' ')
-        print(
-            f"speak-daemon: [q#{qid}]   clause {i+1}/{len(clauses)} "
-            f"{cache_tag} synth={synth_ms:.0f}ms write={write_ms:.0f}ms "
-            f"audio={dur:.2f}s speed={speed} \"{clause_label}\"",
-            file=sys.stderr,
-        )
-
-        if needs_upgrade:
-            task = asyncio.create_task(loop.run_in_executor(
-                None, synth.bg_upgrade,
+            synth_t0 = time.monotonic()
+            pcm, needs_upgrade = await loop.run_in_executor(
+                None, synth.synthesize_sentence,
                 sentence, voice_name, voice, speed, lang,
-            ))
-            bg_task_tracker(task)
+            )
+            synth_ms = (time.monotonic() - synth_t0) * 1000
+            stats["total_synth_ms"] += synth_ms
 
-    # No explicit wait needed — backpressure from chunked writes keeps us
-    # paced with ffplay. By the time all writes complete, most audio has
-    # already played. The persistent stream means the next item flows
-    # seamlessly without any gap.
+            if skip_flag_fn():
+                break
+
+            # Apply volume gain
+            if gain != 1.0:
+                samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+                samples = np.clip(samples * gain, -32767, 32767).astype(np.int16)
+                pcm = samples.tobytes()
+
+            cache_tag = "HIT" if synth_ms < 5 else ("ASM" if needs_upgrade else "SYN")
+
+            await pipe.put((i, sentence, pcm, synth_ms, cache_tag))
+
+            if needs_upgrade:
+                task = asyncio.create_task(loop.run_in_executor(
+                    None, synth.bg_upgrade,
+                    sentence, voice_name, voice, speed, lang,
+                ))
+                bg_task_tracker(task)
+
+        await pipe.put(_DONE)
+
+    async def consumer():
+        """Pull synthesized PCM from the queue and write to ffplay."""
+        while True:
+            item = await pipe.get()
+            if item is _DONE:
+                break
+            if skip_flag_fn():
+                continue
+
+            i, sentence, pcm, synth_ms, cache_tag = item
+
+            write_t0 = time.monotonic()
+            dur = await ffplay.write_pcm(pcm, skip_flag_fn=skip_flag_fn)
+            write_ms = (time.monotonic() - write_t0) * 1000
+            stats["total_audio_secs"] += dur
+            stats["clauses_done"] += 1
+
+            clause_label = sentence[:40].replace('\n', ' ')
+            print(
+                f"speak-daemon: [q#{qid}]   clause {i+1}/{n_clauses} "
+                f"{cache_tag} synth={synth_ms:.0f}ms write={write_ms:.0f}ms "
+                f"audio={dur:.2f}s speed={speed} \"{clause_label}\"",
+                file=sys.stderr,
+            )
+
+    producer_task = asyncio.create_task(producer())
+    consumer_task = asyncio.create_task(consumer())
+    await asyncio.gather(producer_task, consumer_task)
+
     total_ms = (time.monotonic() - item_t0) * 1000
     proc_alive = ffplay.is_alive
+    done = stats["clauses_done"]
+    if done < n_clauses:
+        print(f"speak-daemon: [q#{qid}] SKIPPED after {done}/{n_clauses} clauses", file=sys.stderr)
     print(
         f"speak-daemon: [q#{qid}] DONE   "
-        f"total={total_ms:.0f}ms audio={total_audio_secs:.2f}s "
-        f"synth={total_synth_ms:.0f}ms ffplay={'alive' if proc_alive else 'DEAD'}",
+        f"total={total_ms:.0f}ms audio={stats['total_audio_secs']:.2f}s "
+        f"synth={stats['total_synth_ms']:.0f}ms ffplay={'alive' if proc_alive else 'DEAD'}",
         file=sys.stderr,
     )
