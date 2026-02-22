@@ -86,6 +86,13 @@ class SpeakDaemon:
                     }
                 elif command == "voice_pool_status":
                     result = {"ok": True, **self.voice_pool.status()}
+                elif command == "voice_release":
+                    voice = request.get("voice", "")
+                    if not voice:
+                        result = {"ok": False, "error": "voice_release requires 'voice' field"}
+                    else:
+                        released = self.voice_pool.release_voice(voice)
+                        result = {"ok": True, "released": released}
                 elif command == "history":
                     n = request.get("n", 10)
                     result = {"ok": True, "entries": self.playback_queue.get_history(n)}

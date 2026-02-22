@@ -88,6 +88,11 @@ Options:
   --voice-unlock NAME      Unlock a caller name
   --voice-locks            List all locked voice assignments
   --voice-pool             Show current pool status (locks + session claims)
+  --voice-weight VOICE N   Set weight for a voice (higher = less preferred, 0 = remove)
+  --voice-weights          List all voice weights
+  --voice-release VOICE    Release active claims on a voice (daemon reassigns on next enqueue)
+  --voice-reject VOICE     Deprioritize a voice and release its claims in one step
+  --voice-keep             Lock the agent's current pool-assigned voice permanently
   --rewrites CMD    Manage pronunciation/phrase rewrites:
                       list            Show all rewrites with review status
                       pending         Show unreviewed entries
@@ -313,6 +318,157 @@ while [[ $# -gt 0 ]]; do
             ;;
         --voice-pool)
             QUEUE_CMD="voice_pool_status"; shift ;;
+        --voice-weight)
+            _vw_voice="${2:-}"
+            _vw_n="${3:-}"
+            if [[ -z "${_vw_voice}" || -z "${_vw_n}" ]]; then
+                echo "speak: --voice-weight requires VOICE N" >&2; exit 1
+            fi
+            _vw_file="${SCRIPT_DIR}/../config/voices.json"
+            if [[ ! -f "${_vw_file}" ]]; then
+                echo '{"locks":{},"weights":{}}' > "${_vw_file}"
+            fi
+            _vw_tmp="$(mktemp)"
+            if [[ "${_vw_n}" == "0" ]]; then
+                # Weight 0 = remove from weights dict
+                jq --arg v "${_vw_voice}" 'if .weights then .weights |= del(.[$v]) else . end' "${_vw_file}" > "${_vw_tmp}" \
+                    && mv "${_vw_tmp}" "${_vw_file}"
+                echo "Cleared weight for ${_vw_voice}"
+            else
+                jq --arg v "${_vw_voice}" --argjson n "${_vw_n}" \
+                    '.weights[$v] = $n' "${_vw_file}" > "${_vw_tmp}" \
+                    && mv "${_vw_tmp}" "${_vw_file}"
+                echo "Set ${_vw_voice} weight to ${_vw_n}"
+            fi
+            exit 0
+            ;;
+        --voice-weights)
+            _vw_file="${SCRIPT_DIR}/../config/voices.json"
+            if [[ ! -f "${_vw_file}" ]] || [[ "$(jq '.weights | length' "${_vw_file}" 2>/dev/null)" == "0" ]]; then
+                echo "No voice weights set."
+            else
+                jq -r '.weights | to_entries | sort_by(.value) | reverse | .[] | "\(.key)  weight: \(.value)"' "${_vw_file}"
+            fi
+            exit 0
+            ;;
+        --voice-release)
+            _vr_voice="${2:-}"
+            if [[ -z "${_vr_voice}" ]]; then
+                echo "speak: --voice-release requires VOICE" >&2; exit 1
+            fi
+            if ! daemon_is_running; then
+                echo "speak: daemon not running (start with: speak --daemon)" >&2
+                exit 1
+            fi
+            python3 -c "
+import socket, struct, json, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+msg = json.dumps({'command': 'voice_release', 'voice': '${_vr_voice}'}).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = sock.recv(resp_len)
+    resp = json.loads(data)
+    released = resp.get('released', [])
+    if released:
+        print(f'Released {len(released)} claim(s) on ${_vr_voice}:')
+        for s in released:
+            print(f'  {s}')
+    else:
+        print(f'No active claims on ${_vr_voice}')
+sock.close()
+"
+            exit 0
+            ;;
+        --voice-reject)
+            _vj_voice="${2:-}"
+            if [[ -z "${_vj_voice}" ]]; then
+                echo "speak: --voice-reject requires VOICE" >&2; exit 1
+            fi
+            # Step 1: Set weight to 100 (deprioritize)
+            _vj_file="${SCRIPT_DIR}/../config/voices.json"
+            if [[ ! -f "${_vj_file}" ]]; then
+                echo '{"locks":{},"weights":{}}' > "${_vj_file}"
+            fi
+            _vj_tmp="$(mktemp)"
+            jq --arg v "${_vj_voice}" --argjson n 100 \
+                '.weights[$v] = $n' "${_vj_file}" > "${_vj_tmp}" \
+                && mv "${_vj_tmp}" "${_vj_file}"
+            # Step 2: Release claims via daemon (if running)
+            if daemon_is_running; then
+                python3 -c "
+import socket, struct, json
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+msg = json.dumps({'command': 'voice_release', 'voice': '${_vj_voice}'}).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = sock.recv(resp_len)
+    resp = json.loads(data)
+    released = resp.get('released', [])
+    if released:
+        print(f'Released {len(released)} session(s) from ${_vj_voice}')
+sock.close()
+"
+            fi
+            echo "Rejected ${_vj_voice} — deprioritized and released. New voice assigned on next enqueue."
+            exit 0
+            ;;
+        --voice-keep)
+            if ! daemon_is_running; then
+                echo "speak: daemon not running (start with: speak --daemon)" >&2
+                exit 1
+            fi
+            _auto_detect_caller
+            if [[ -z "${CALLER}" ]]; then
+                echo "speak: could not detect caller name" >&2; exit 1
+            fi
+            # Query pool status and find this caller's voice
+            _vk_voice="$(python3 -c "
+import socket, struct, json
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+msg = json.dumps({'command': 'voice_pool_status'}).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = sock.recv(resp_len)
+    resp = json.loads(data)
+    caller = '${CALLER}'
+    # Check locks first
+    if caller in resp.get('locks', {}):
+        print(resp['locks'][caller]['voice'])
+    else:
+        # Search claims for this caller
+        for key, val in resp.get('claims', {}).items():
+            if key.startswith(caller + ':'):
+                print(val['voice'])
+                break
+sock.close()
+")"
+            if [[ -z "${_vk_voice}" ]]; then
+                echo "speak: no voice assignment found for caller '${CALLER}'" >&2; exit 1
+            fi
+            # Lock it
+            _vk_file="${SCRIPT_DIR}/../config/voices.json"
+            if [[ ! -f "${_vk_file}" ]]; then
+                echo '{"locks":{},"weights":{}}' > "${_vk_file}"
+            fi
+            _vk_tmp="$(mktemp)"
+            jq --arg n "${CALLER}" --arg v "${_vk_voice}" \
+                '.locks[$n] = {"voice": $v, "gain": 1.0}' "${_vk_file}" > "${_vk_tmp}" \
+                && mv "${_vk_tmp}" "${_vk_file}"
+            echo "Locked ${CALLER} to ${_vk_voice}"
+            exit 0
+            ;;
         --rewrites)   python3 "${SCRIPT_DIR}/speak-test-rewrites" "${@:2}"; exit $? ;;
         --mute)       touch "${MUTE_FILE}"; echo "speak: audio mode muted" >&2; exit 0 ;;
         --unmute)     rm -f "${MUTE_FILE}"; echo "speak: audio mode unmuted" >&2; exit 0 ;;

@@ -4,5 +4,6 @@
       "voice": "af_heart",
       "gain": 1.0
     }
-  }
+  },
+  "weights": {}
 }
