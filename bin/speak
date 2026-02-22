@@ -95,15 +95,19 @@ EOF
 }
 
 # --- Dependency checks ---
-missing=()
-command -v uv    >/dev/null 2>&1 || missing+=(uv)
-command -v ffplay >/dev/null 2>&1 || missing+=(ffmpeg)
-
-if [[ ${#missing[@]} -gt 0 ]]; then
-    echo "speak: missing required tools: ${missing[*]}" >&2
-    echo "Install them and try again." >&2
+if ! command -v uv >/dev/null 2>&1; then
+    echo "speak: missing required tool: uv" >&2
+    echo "Install it and try again." >&2
     exit 1
 fi
+
+# ffplay is only needed for non-daemon paths (direct mode, piper, client streaming)
+_require_ffplay() {
+    if ! command -v ffplay >/dev/null 2>&1; then
+        echo "speak: this mode requires ffplay (install ffmpeg)" >&2
+        exit 1
+    fi
+}
 
 # --- Daemon management helpers ---
 daemon_is_running() {
@@ -125,7 +129,7 @@ start_daemon() {
 
     local logfile="${SOCK_PATH}.log"
     echo "speak: starting daemon... (log: ${logfile})" >&2
-    uv run --python 3.14 --with kokoro-onnx -- \
+    uv run --python 3.14 --with kokoro-onnx --with sounddevice -- \
         python3 "${SCRIPT_DIR}/speak-daemon" \
             --model "${model}" --voices "${voices}" 2>"${logfile}" &
     disown
@@ -412,6 +416,7 @@ speak_kokoro() {
         echo "speak: saved to ${SAVE_FILE}" >&2
     else
         # Stream via daemon -> speak-client -> ffplay
+        _require_ffplay
         printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
                 --voice "${VOICE}" --speed "${SPEED}" \
         | ffplay -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -i pipe:0 -loglevel quiet
@@ -420,6 +425,7 @@ speak_kokoro() {
 
 # Fallback: direct mode without daemon (cold start each time)
 speak_kokoro_direct() {
+    _require_ffplay
     local model="${KOKORO_DIR}/kokoro-v1.0.onnx"
     local voices="${KOKORO_DIR}/voices-v1.0.bin"
 
@@ -439,6 +445,7 @@ speak_kokoro_direct() {
 # Piper engine
 # =============================================================================
 speak_piper() {
+    _require_ffplay
     command -v jq >/dev/null 2>&1 || { echo "speak: piper engine requires jq" >&2; exit 1; }
 
     local model="${PIPER_VOICES_DIR}/${VOICE}.onnx"

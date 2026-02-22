@@ -12,7 +12,7 @@ import asyncio
 import sys
 from typing import Callable
 
-from .ffplay import FFPlayStream
+from .playback_device import AudioOutputStream
 from .history import SpeechHistory
 from .protocol import publish_state
 from .renderer import render_speech
@@ -39,7 +39,7 @@ class PlaybackQueue:
         self._bg_task_tracker = bg_task_tracker
         self._queue: asyncio.Queue = asyncio.Queue()
         self._current: dict | None = None
-        self._ffplay = FFPlayStream()
+        self._ffplay = AudioOutputStream()
         self._worker_task: asyncio.Task | None = None
         self._id_counter = 0
         self._skip_flag = False
