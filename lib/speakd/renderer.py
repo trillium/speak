@@ -99,11 +99,11 @@ async def render_speech(
             await pipe.put((i, sentence, pcm, synth_ms, cache_tag, enqueued_at))
 
             if needs_upgrade:
-                task = asyncio.create_task(loop.run_in_executor(
+                future = loop.run_in_executor(
                     None, synth.bg_upgrade,
                     sentence, voice_name, voice, speed, lang,
-                ))
-                bg_task_tracker(task)
+                )
+                bg_task_tracker(future)
 
         await pipe.put(_DONE)
 

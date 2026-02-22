@@ -26,7 +26,7 @@ class SpeakDaemon:
         self.synth = SynthesisEngine(self.kokoro, self.cache)
         self.last_activity = time.monotonic()
         self.active_connections = 0
-        self._bg_tasks: set[asyncio.Task] = set()
+        self._bg_tasks: set[asyncio.Future] = set()
         self.start_time = time.time()
         self.playback_queue = PlaybackQueue(
             synth=self.synth,
@@ -37,9 +37,9 @@ class SpeakDaemon:
     def _touch_activity(self):
         self.last_activity = time.monotonic()
 
-    def _track_bg_task(self, task: asyncio.Task):
-        self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+    def _track_bg_task(self, future: asyncio.Future):
+        self._bg_tasks.add(future)
+        future.add_done_callback(self._bg_tasks.discard)
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.active_connections += 1
