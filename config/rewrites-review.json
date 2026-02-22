@@ -3,8 +3,8 @@
     "word": "daemon",
     "value": "day-mon",
     "section": "pronunciation",
-    "status": "accepted",
-    "reviewed_at": 1771638545.2965708
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.253969
   },
   "pronunciation:sqlite": {
     "word": "sqlite",
@@ -122,21 +122,679 @@
     "word": "rewrites",
     "value": "ree writes",
     "section": "pronunciation",
-    "status": "pending",
-    "rejected_alts": ["re-rights"]
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.404883
   },
   "pronunciation:rewrite": {
     "word": "rewrite",
     "value": "ree write",
     "section": "pronunciation",
-    "status": "pending",
-    "rejected_alts": ["re-right"]
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.365933
   },
   "pronunciation:rewriting": {
     "word": "rewriting",
     "value": "ree writing",
     "section": "pronunciation",
-    "status": "pending",
-    "rejected_alts": ["re-righting"]
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.441798
+  },
+  "phrase_rewrites:anymore": {
+    "word": "anymore",
+    "value": "any more",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.856
+  },
+  "pronunciation:.env": {
+    "word": ".env",
+    "value": "dot env",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.383193
+  },
+  "phrase_rewrites:Absolutely!": {
+    "word": "Absolutely!",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.4214048
+  },
+  "pronunciation:CLI": {
+    "word": "CLI",
+    "value": "C L I",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.458722
+  },
+  "pronunciation:CORS": {
+    "word": "CORS",
+    "value": "cors",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.495907
+  },
+  "phrase_rewrites:Exactly right": {
+    "word": "Exactly right",
+    "value": "Correct",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.532879
+  },
+  "phrase_rewrites:Excellent question": {
+    "word": "Excellent question",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.568713
+  },
+  "phrase_rewrites:Fantastic!": {
+    "word": "Fantastic!",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.6054559
+  },
+  "pronunciation:G2P": {
+    "word": "G2P",
+    "value": "G 2 P",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.641997
+  },
+  "phrase_rewrites:Great question": {
+    "word": "Great question",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.678509
+  },
+  "phrase_rewrites:I would be happy to": {
+    "word": "I would be happy to",
+    "value": "I'll",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.714887
+  },
+  "phrase_rewrites:I'd be happy to": {
+    "word": "I'd be happy to",
+    "value": "I'll",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.751285
+  },
+  "phrase_rewrites:I'd be happy to help": {
+    "word": "I'd be happy to help",
+    "value": "I'll",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.788116
+  },
+  "pronunciation:IPA": {
+    "word": "IPA",
+    "value": "eye pee ay",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.8249002
+  },
+  "pronunciation:JSON": {
+    "word": "JSON",
+    "value": "jason",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.86221
+  },
+  "pronunciation:JSONL": {
+    "word": "JSONL",
+    "value": "jason L",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.900148
+  },
+  "pronunciation:JWT": {
+    "word": "JWT",
+    "value": "J W T",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.9364119
+  },
+  "pronunciation:LLM": {
+    "word": "LLM",
+    "value": "L L M",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705501.973154
+  },
+  "phrase_rewrites:Let me help you with that": {
+    "word": "Let me help you with that",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.009829
+  },
+  "pronunciation:NLTK": {
+    "word": "NLTK",
+    "value": "N L T K",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.0470989
+  },
+  "pronunciation:OAuth": {
+    "word": "OAuth",
+    "value": "oh-auth",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.084827
+  },
+  "pronunciation:ONNX": {
+    "word": "ONNX",
+    "value": "onyx",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.123178
+  },
+  "phrase_rewrites:Of course!": {
+    "word": "Of course!",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.162059
+  },
+  "pronunciation:PCM": {
+    "word": "PCM",
+    "value": "P C M",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.202304
+  },
+  "phrase_rewrites:Perfect!": {
+    "word": "Perfect!",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.242939
+  },
+  "pronunciation:PyPI": {
+    "word": "PyPI",
+    "value": "pie P I",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.28266
+  },
+  "pronunciation:STT": {
+    "word": "STT",
+    "value": "S T T",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.3216379
+  },
+  "phrase_rewrites:Sure thing!": {
+    "word": "Sure thing!",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.3605819
+  },
+  "pronunciation:TOML": {
+    "word": "TOML",
+    "value": "tom L",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.399887
+  },
+  "pronunciation:TTS": {
+    "word": "TTS",
+    "value": "T T S",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.438231
+  },
+  "phrase_rewrites:That's a great question": {
+    "word": "That's a great question",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.476644
+  },
+  "phrase_rewrites:That's a really good point": {
+    "word": "That's a really good point",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.521954
+  },
+  "phrase_rewrites:That's an excellent point": {
+    "word": "That's an excellent point",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.561128
+  },
+  "phrase_rewrites:That's exactly right": {
+    "word": "That's exactly right",
+    "value": "Correct",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.600043
+  },
+  "pronunciation:UUID": {
+    "word": "UUID",
+    "value": "you-id",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.636914
+  },
+  "pronunciation:WAV": {
+    "word": "WAV",
+    "value": "wave",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.673534
+  },
+  "phrase_rewrites:Wonderful!": {
+    "word": "Wonderful!",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.710742
+  },
+  "pronunciation:YAML": {
+    "word": "YAML",
+    "value": "yammel",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.747515
+  },
+  "phrase_rewrites:You are absolutely right": {
+    "word": "You are absolutely right",
+    "value": "I'm a cat meow",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.783563
+  },
+  "phrase_rewrites:You're absolutely right": {
+    "word": "You're absolutely right",
+    "value": "I'm a cat meow",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.819701
+  },
+  "pronunciation:async": {
+    "word": "async",
+    "value": "eh-sink",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.8931699
+  },
+  "pronunciation:backend": {
+    "word": "backend",
+    "value": "back end",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.9299998
+  },
+  "pronunciation:cerr": {
+    "word": "cerr",
+    "value": "see error",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705502.98343
+  },
+  "pronunciation:chmod": {
+    "word": "chmod",
+    "value": "ch mod",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.0326378
+  },
+  "pronunciation:chown": {
+    "word": "chown",
+    "value": "ch own",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.0709178
+  },
+  "pronunciation:cin": {
+    "word": "cin",
+    "value": "see in",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.107697
+  },
+  "pronunciation:codebase": {
+    "word": "codebase",
+    "value": "code base",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.145816
+  },
+  "pronunciation:cout": {
+    "word": "cout",
+    "value": "see out",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.188405
+  },
+  "pronunciation:dotfile": {
+    "word": "dotfile",
+    "value": "dot file",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.308052
+  },
+  "pronunciation:dotfiles": {
+    "word": "dotfiles",
+    "value": "dot files",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.348518
+  },
+  "pronunciation:endif": {
+    "word": "endif",
+    "value": "end if",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.387452
+  },
+  "pronunciation:endl": {
+    "word": "endl",
+    "value": "end L",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.4318771
+  },
+  "pronunciation:enum": {
+    "word": "enum",
+    "value": "ee-num",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.470494
+  },
+  "pronunciation:env": {
+    "word": "env",
+    "value": "env",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.50829
+  },
+  "phrase_rewrites:exactly right": {
+    "word": "exactly right",
+    "value": "correct",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.545824
+  },
+  "pronunciation:ffmpeg": {
+    "word": "ffmpeg",
+    "value": "f f mpeg",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.582779
+  },
+  "pronunciation:ffplay": {
+    "word": "ffplay",
+    "value": "f f play",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.619176
+  },
+  "pronunciation:filename": {
+    "word": "filename",
+    "value": "file name",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.6563358
+  },
+  "pronunciation:filepath": {
+    "word": "filepath",
+    "value": "file path",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.694046
+  },
+  "pronunciation:fprintf": {
+    "word": "fprintf",
+    "value": "f print f",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.730146
+  },
+  "pronunciation:frontend": {
+    "word": "frontend",
+    "value": "front end",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.766541
+  },
+  "pronunciation:g2p": {
+    "word": "g2p",
+    "value": "G 2 P",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.803315
+  },
+  "pronunciation:gitignore": {
+    "word": "gitignore",
+    "value": "git ignore",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.840467
+  },
+  "phrase_rewrites:great question": {
+    "word": "great question",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.877559
+  },
+  "pronunciation:hotfix": {
+    "word": "hotfix",
+    "value": "hot fix",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.9142442
+  },
+  "pronunciation:hotpath": {
+    "word": "hotpath",
+    "value": "hot path",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.95184
+  },
+  "pronunciation:ifdef": {
+    "word": "ifdef",
+    "value": "if def",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705503.989085
+  },
+  "pronunciation:iostream": {
+    "word": "iostream",
+    "value": "eye oh stream",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.026957
+  },
+  "pronunciation:localhost": {
+    "word": "localhost",
+    "value": "local host",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.063172
+  },
+  "pronunciation:malloc": {
+    "word": "malloc",
+    "value": "mal-ock",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.1000772
+  },
+  "pronunciation:middleware": {
+    "word": "middleware",
+    "value": "middle ware",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.1367471
+  },
+  "pronunciation:mkdir": {
+    "word": "mkdir",
+    "value": "make dir",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.1729338
+  },
+  "pronunciation:onwards": {
+    "word": "onwards",
+    "value": "on-words",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.2102442
+  },
+  "pronunciation:printf": {
+    "word": "printf",
+    "value": "print f",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.249453
+  },
+  "pronunciation:queries": {
+    "word": "queries",
+    "value": "kweer-eez",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.2859242
+  },
+  "pronunciation:regex": {
+    "word": "regex",
+    "value": "reg-ex",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.323453
+  },
+  "pronunciation:rmdir": {
+    "word": "rmdir",
+    "value": "remove dir",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.47943
+  },
+  "pronunciation:roundtrip": {
+    "word": "roundtrip",
+    "value": "round trip",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.5183191
+  },
+  "pronunciation:scanf": {
+    "word": "scanf",
+    "value": "scan f",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.554822
+  },
+  "pronunciation:sprintf": {
+    "word": "sprintf",
+    "value": "s print f",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.5916731
+  },
+  "pronunciation:startup": {
+    "word": "startup",
+    "value": "start-up",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.628793
+  },
+  "pronunciation:stderr": {
+    "word": "stderr",
+    "value": "standard error",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.665451
+  },
+  "pronunciation:stdin": {
+    "word": "stdin",
+    "value": "standard in",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.702434
+  },
+  "pronunciation:stdout": {
+    "word": "stdout",
+    "value": "standard out",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.740103
+  },
+  "pronunciation:strcmp": {
+    "word": "strcmp",
+    "value": "string compare",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.776462
+  },
+  "pronunciation:strlen": {
+    "word": "strlen",
+    "value": "string length",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.813183
+  },
+  "pronunciation:struct": {
+    "word": "struct",
+    "value": "struct",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.849906
+  },
+  "pronunciation:subprocess": {
+    "word": "subprocess",
+    "value": "sub process",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.888074
+  },
+  "pronunciation:symlink": {
+    "word": "symlink",
+    "value": "sim-link",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.925035
+  },
+  "phrase_rewrites:that's a great question": {
+    "word": "that's a great question",
+    "value": "",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.961882
+  },
+  "pronunciation:typedef": {
+    "word": "typedef",
+    "value": "type def",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705504.9991941
+  },
+  "pronunciation:webhook": {
+    "word": "webhook",
+    "value": "web hook",
+    "section": "pronunciation",
+    "status": "unnecessary",
+    "reviewed_at": 1771705505.036159
+  },
+  "phrase_rewrites:you are absolutely right": {
+    "word": "you are absolutely right",
+    "value": "I'm a cat meow",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705505.072927
+  },
+  "phrase_rewrites:you're absolutely right": {
+    "word": "you're absolutely right",
+    "value": "I'm a cat meow",
+    "section": "phrase_rewrites",
+    "status": "unnecessary",
+    "reviewed_at": 1771705505.10967
   }
 }
