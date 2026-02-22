@@ -14,6 +14,7 @@ VOICE=""
 CALLER="${SPEAK_CALLER:-}"
 ENQUEUE_BACKEND="${SPEAK_ENQUEUE_BACKEND:-auto}"  # auto, c, perl, python
 FLAGGED_FILE="${SCRIPT_DIR}/../config/flagged.json"
+MUTE_FILE="/tmp/speak-${USER}.muted"
 
 # Auto-detect caller from git repo name or cwd basename
 _auto_detect_caller() {
@@ -57,6 +58,8 @@ Options:
   --flag WORD/PHRASE  Flag a word or phrase that sounds wrong (triage later)
   --flagged         Show all flagged words/phrases
   --unflag WORD     Remove a word/phrase from the flagged list
+  --mute            Mute audio mode (speak commands will fail fast)
+  --unmute          Unmute audio mode
   --rewrites CMD    Manage pronunciation/phrase rewrites:
                       list            Show all rewrites with review status
                       pending         Show unreviewed entries
@@ -237,6 +240,8 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         --rewrites)   python3 "${SCRIPT_DIR}/speak-test-rewrites" "${@:2}"; exit $? ;;
+        --mute)       touch "${MUTE_FILE}"; echo "speak: audio mode muted" >&2; exit 0 ;;
+        --unmute)     rm -f "${MUTE_FILE}"; echo "speak: audio mode unmuted" >&2; exit 0 ;;
         --enqueue-backend) ENQUEUE_BACKEND="$2"; shift 2 ;;
         --)           shift; TEXT_ARGS+=("$@"); break ;;
         *)            TEXT_ARGS+=("$1"); shift ;;
@@ -314,6 +319,12 @@ if [[ "${LIST_VOICES}" == true ]]; then
             ;;
     esac
     exit 0
+fi
+
+# --- Mute check (allow daemon/queue commands through) ---
+if [[ -f "${MUTE_FILE}" ]]; then
+    echo "speak: audio mode is muted (use 'speak --unmute' to re-enable)" >&2
+    exit 1
 fi
 
 # --- Collect text ---
