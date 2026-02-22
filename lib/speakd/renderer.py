@@ -11,6 +11,7 @@ import time
 import numpy as np
 
 from .ffplay import FFPlayStream
+from .protocol import log_event
 from .synthesis import SynthesisEngine
 from .text import split_clauses
 from .tones import get_caller_voice
@@ -54,6 +55,8 @@ async def render_speech(
     caller_tag = f" caller={caller}" if caller else ""
     gain_tag = f" gain={gain}" if gain != 1.0 else ""
     print(f"speak-daemon: [q#{qid}] START  voice={voice_name} speed={speed}{caller_tag}{gain_tag} \"{label}\"", file=sys.stderr)
+    log_event("request_start", qid=qid, voice=voice_name, speed=speed,
+              caller=caller, text=label)
 
     voice = synth.kokoro.get_voice_style(voice_name)
     clauses = split_clauses(text)
@@ -87,8 +90,13 @@ async def render_speech(
                 pcm = samples.tobytes()
 
             cache_tag = "HIT" if synth_ms < 5 else ("ASM" if needs_upgrade else "SYN")
+            enqueued_at = time.monotonic()
 
-            await pipe.put((i, sentence, pcm, synth_ms, cache_tag))
+            log_event("clause_synthesized", qid=qid, clause=i+1, n=n_clauses,
+                      synth_ms=round(synth_ms, 1), cache=cache_tag,
+                      audio_bytes=len(pcm))
+
+            await pipe.put((i, sentence, pcm, synth_ms, cache_tag, enqueued_at))
 
             if needs_upgrade:
                 task = asyncio.create_task(loop.run_in_executor(
@@ -101,6 +109,7 @@ async def render_speech(
 
     async def consumer():
         """Pull synthesized PCM from the queue and write to ffplay."""
+        last_write_end = None
         while True:
             item = await pipe.get()
             if item is _DONE:
@@ -108,19 +117,36 @@ async def render_speech(
             if skip_flag_fn():
                 continue
 
-            i, sentence, pcm, synth_ms, cache_tag = item
+            i, sentence, pcm, synth_ms, cache_tag, enqueued_at = item
+            dequeued_at = time.monotonic()
+            queue_wait_ms = (dequeued_at - enqueued_at) * 1000
+
+            # Gap = time between previous clause's last write and this clause's first write
+            gap_ms = (dequeued_at - last_write_end) * 1000 if last_write_end else 0.0
+
+            n_samples = len(pcm) // 2
+            audio_dur = n_samples / 24000  # SAMPLE_RATE
+
+            log_event("clause_play_start", qid=qid, clause=i+1, n=n_clauses,
+                      queue_wait_ms=round(queue_wait_ms, 1),
+                      gap_ms=round(gap_ms, 1), audio_secs=round(audio_dur, 2))
 
             write_t0 = time.monotonic()
             dur = await ffplay.write_pcm(pcm, skip_flag_fn=skip_flag_fn)
             write_ms = (time.monotonic() - write_t0) * 1000
+            last_write_end = time.monotonic()
             stats["total_audio_secs"] += dur
             stats["clauses_done"] += 1
+
+            log_event("clause_play_end", qid=qid, clause=i+1, n=n_clauses,
+                      write_ms=round(write_ms, 1), audio_secs=round(dur, 2))
 
             clause_label = sentence[:40].replace('\n', ' ')
             print(
                 f"speak-daemon: [q#{qid}]   clause {i+1}/{n_clauses} "
                 f"{cache_tag} synth={synth_ms:.0f}ms write={write_ms:.0f}ms "
-                f"audio={dur:.2f}s speed={speed} \"{clause_label}\"",
+                f"gap={gap_ms:.0f}ms wait={queue_wait_ms:.0f}ms "
+                f"audio={dur:.2f}s \"{clause_label}\"",
                 file=sys.stderr,
             )
 
@@ -139,3 +165,7 @@ async def render_speech(
         f"synth={stats['total_synth_ms']:.0f}ms ffplay={'alive' if proc_alive else 'DEAD'}",
         file=sys.stderr,
     )
+    log_event("request_done", qid=qid, total_ms=round(total_ms, 1),
+              audio_secs=round(stats["total_audio_secs"], 2),
+              synth_ms=round(stats["total_synth_ms"], 1),
+              clauses_done=done, clauses_total=n_clauses)
