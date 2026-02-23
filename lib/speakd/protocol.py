@@ -7,6 +7,16 @@ import time
 
 from .config import EVENT_LOG_PATH, STATE_PATH
 
+# Broadcast frame type tags
+FRAME_TYPE_AUDIO = 0x01
+FRAME_TYPE_METADATA = 0x02
+
+
+def encode_broadcast_frame(frame_type: int, payload: bytes) -> bytes:
+    """Encode a broadcast frame: [4-byte BE length][1-byte type][payload]."""
+    total_len = 1 + len(payload)
+    return struct.pack("!IB", total_len, frame_type) + payload
+
 
 def send_json(writer, obj: dict) -> None:
     """Send a JSON response using the length-prefixed protocol, then zero terminator."""

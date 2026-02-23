@@ -47,6 +47,8 @@ def main():
                         help="Session ID for voice pool (default: PPID)")
     parser.add_argument("--command",
                         help="Send a queue command (queue_status, skip, clear, replay)")
+    parser.add_argument("--subscribe", action="store_true",
+                        help="Subscribe to audio broadcast (PCM to stdout, metadata to stderr)")
     args = parser.parse_args()
 
     sock_path = f"/tmp/speak-{os.environ['USER']}.sock"
@@ -60,6 +62,38 @@ def main():
         sock.close()
         if resp:
             print(json.dumps(resp, indent=2))
+        return
+
+    # --- Subscribe mode ---
+    if args.subscribe:
+        _send_request(sock, {"command": "subscribe", "include_metadata": True})
+        resp = _read_json_response(sock)
+        if resp:
+            print(json.dumps(resp), file=sys.stderr)
+        # Read broadcast frames: [4-byte len][1-byte type][payload]
+        try:
+            while True:
+                raw_len = _recvall(sock, 4)
+                if not raw_len:
+                    break
+                frame_len = struct.unpack("!I", raw_len)[0]
+                if frame_len == 0:
+                    print("subscribe: daemon shutdown", file=sys.stderr)
+                    break
+                frame = _recvall(sock, frame_len)
+                if not frame:
+                    break
+                frame_type = frame[0]
+                payload = frame[1:]
+                if frame_type == 0x01:  # audio
+                    sys.stdout.buffer.write(payload)
+                    sys.stdout.buffer.flush()
+                elif frame_type == 0x02:  # metadata
+                    print(payload.decode(), file=sys.stderr)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            sock.close()
         return
 
     text = sys.stdin.read().strip()

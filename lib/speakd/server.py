@@ -15,6 +15,7 @@ from .config import CACHE_DIR, CACHE_TTL_DAYS, IDLE_TIMEOUT, SOCKET_PATH
 from .kokoro_patch import apply_patch
 from .playback import PlaybackQueue
 from .protocol import send_json
+from .subscribers import SubscriberManager
 from .synthesis import SynthesisEngine
 from .text import split_clauses
 from .voice_pool import VoicePool
@@ -32,11 +33,13 @@ class SpeakDaemon:
         config_dir = os.path.join(os.path.dirname(__file__), "..", "..", "config")
         voice_config = os.path.join(config_dir, "voices.json")
         self.voice_pool = VoicePool(voice_config)
+        self.subscriber_manager = SubscriberManager()
         self.playback_queue = PlaybackQueue(
             synth=self.synth,
             on_activity=self._touch_activity,
             bg_task_tracker=self._track_bg_task,
             voice_pool=self.voice_pool,
+            subscriber_manager=self.subscriber_manager,
         )
 
     def _touch_activity(self):
@@ -83,6 +86,7 @@ class SpeakDaemon:
                             "playing": q._current.get("text", "")[:80] if q._current else None,
                         },
                         "cache": self.cache.stats(),
+                        "subscribers": self.subscriber_manager.status(),
                     }
                 elif command == "voice_pool_status":
                     result = {"ok": True, **self.voice_pool.status()}
@@ -104,6 +108,29 @@ class SpeakDaemon:
                     caller = request.get("caller", "")
                     n = request.get("n", 10)
                     result = {"ok": True, "entries": self.playback_queue.get_history_by_caller(caller, n)}
+                elif command == "subscribe":
+                    include_metadata = request.get("include_metadata", True)
+                    send_json(writer, {
+                        "ok": True, "subscribed": True,
+                        "sample_rate": 24000, "channels": 1, "format": "s16le",
+                    })
+                    await writer.drain()
+                    # Send current state so subscriber has context
+                    q = self.playback_queue
+                    if q._current:
+                        self.subscriber_manager.broadcast_metadata({
+                            "event": "item_start",
+                            "playing": {
+                                "id": q._current.get("_queue_id"),
+                                "caller": q._current.get("caller", ""),
+                                "voice": q._current.get("_resolved_voice", ""),
+                                "text": q._current.get("text", "")[:120],
+                            },
+                        })
+                    info = self.subscriber_manager.add(writer, include_metadata)
+                    # Keep connection alive until subscriber disconnects
+                    await info.disconnect_event.wait()
+                    return
                 else:
                     result = {"ok": False, "error": f"unknown command: {command}"}
                 send_json(writer, result)
@@ -161,11 +188,13 @@ class SpeakDaemon:
         finally:
             self.active_connections -= 1
             self.last_activity = time.monotonic()
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+            # Don't close writer if it's a managed subscriber
+            if writer not in self.subscriber_manager._subscribers:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     async def idle_watchdog(self):
         """Shut down if idle for IDLE_TIMEOUT seconds. Evict expired cache periodically."""
@@ -174,7 +203,8 @@ class SpeakDaemon:
         while True:
             await asyncio.sleep(30)
             idle_for = time.monotonic() - self.last_activity
-            if self.active_connections == 0 and idle_for >= IDLE_TIMEOUT and not self.playback_queue.is_active:
+            non_subscriber_conns = self.active_connections - self.subscriber_manager.count
+            if non_subscriber_conns <= 0 and idle_for >= IDLE_TIMEOUT and not self.playback_queue.is_active:
                 print(f"speak-daemon: idle for {IDLE_TIMEOUT}s, shutting down", file=sys.stderr)
                 cleanup_and_exit()
             if time.monotonic() - last_evict > evict_interval:

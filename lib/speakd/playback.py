@@ -34,14 +34,16 @@ class PlaybackQueue:
         on_activity: Callable[[], None],
         bg_task_tracker: Callable[[asyncio.Task], None],
         voice_pool: VoicePool | None = None,
+        subscriber_manager=None,
     ):
         self.synth = synth
         self._on_activity = on_activity
         self._bg_task_tracker = bg_task_tracker
         self.voice_pool = voice_pool
+        self._subscriber_manager = subscriber_manager
         self._queue: asyncio.Queue = asyncio.Queue()
         self._current: dict | None = None
-        self._ffplay = AudioOutputStream()
+        self._ffplay = AudioOutputStream(subscriber_manager=subscriber_manager)
         self._worker_task: asyncio.Task | None = None
         self._id_counter = 0
         self._skip_flag = False
@@ -130,7 +132,7 @@ class PlaybackQueue:
         return result
 
     def _publish(self, event: str, **extra):
-        """Publish state change for external tools."""
+        """Publish state change for external tools and broadcast to subscribers."""
         pending = list(self._queue._queue)
         state = {
             "event": event,
@@ -148,6 +150,8 @@ class PlaybackQueue:
             }
         state.update(extra)
         publish_state(state)
+        if self._subscriber_manager:
+            self._subscriber_manager.broadcast_metadata(state)
 
     async def _worker(self):
         loop = asyncio.get_event_loop()

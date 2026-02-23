@@ -18,8 +18,9 @@ WRITE_CHUNK_BYTES = int(SAMPLE_RATE * 2 * 0.25)  # 0.25s of audio per write
 class AudioOutputStream:
     """Manages a sounddevice RawOutputStream for continuous PCM streaming."""
 
-    def __init__(self):
+    def __init__(self, subscriber_manager=None):
         self._stream: sd.RawOutputStream | None = None
+        self._subscriber_manager = subscriber_manager
 
     @property
     def is_alive(self) -> bool:
@@ -94,6 +95,8 @@ class AudioOutputStream:
                 self._stream = None
                 await self.ensure_running()
                 await loop.run_in_executor(None, self._stream.write, chunk)
+            if self._subscriber_manager:
+                self._subscriber_manager.broadcast_audio(chunk)
             offset += len(chunk)
         n_samples = len(pcm) // 2  # int16
         return n_samples / SAMPLE_RATE
