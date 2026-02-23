@@ -15,7 +15,7 @@ from typing import Callable
 from .playback_device import AudioOutputStream
 from .history import SpeechHistory
 from .protocol import publish_state
-from .renderer import render_speech
+from .renderer import prefetch_first_chunk, render_speech
 from .synthesis import SynthesisEngine
 from .tones import (
     CALLER_GAP,
@@ -182,6 +182,17 @@ class PlaybackQueue:
                 request["_resolved_voice"] = voice_name
                 request["_gain"] = gain
 
+                # Kick off TTS synthesis (prefetch first chunk) concurrently
+                # with the caller tone so speech is ready when tone ends.
+                text = request.get("text", "").strip()
+                speed = request.get("speed", 1.0)
+                lang = request.get("lang", "en-us")
+                prefetch_task = None
+                if text:
+                    prefetch_task = asyncio.create_task(
+                        prefetch_first_chunk(self.synth, text, voice_name, speed, lang)
+                    )
+
                 # Start tone
                 if caller:
                     await self._ffplay.write_pcm(get_caller_tone(caller))
@@ -203,11 +214,17 @@ class PlaybackQueue:
 
                 self._publish("playing")
 
-                # The actual speech
+                # Await prefetched first chunk (should be ready by now)
+                prefetch = None
+                if prefetch_task is not None:
+                    prefetch = await prefetch_task
+
+                # The actual speech (uses prefetched first chunk if available)
                 await render_speech(
                     request, loop, self.synth, self._ffplay,
                     skip_flag_fn=lambda: self._skip_flag,
                     bg_task_tracker=self._bg_task_tracker,
+                    prefetch=prefetch,
                 )
 
                 # End tone
