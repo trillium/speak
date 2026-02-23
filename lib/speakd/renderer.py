@@ -1,11 +1,19 @@
-"""Speech rendering using Kokoro's native streaming.
+"""Speech rendering with clause-level streaming.
 
-Feeds full text to Kokoro's create_stream(), which handles phoneme
-splitting internally (only at 510+ phoneme boundaries). Each audio
-chunk is written directly to ffplay for playback.
+Splits text into clauses before synthesis so the first clause can be
+prefetched during caller tone playback. Kokoro generates the entire
+utterance as a single chunk when phonemes < 510 (most normal text),
+so without splitting, prefetch has to wait for the whole thing.
 
-Supports prefetching: the first TTS chunk can be generated concurrently
-with caller tone playback to eliminate the audible gap between them.
+Benchmark data (Kokoro v1.0, Apple M-series):
+  tiny  (7 phonemes):   ~350ms
+  short (24 phonemes):  ~400ms
+  medium(69 phonemes):  ~850ms
+  long  (291 phonemes): ~3500ms
+
+By splitting into clauses, the first clause is typically 5-30 phonemes
+and can be synthesized in 300-500ms — well within the caller tone
+duration (~400-960ms).
 """
 
 import asyncio
@@ -18,25 +26,50 @@ import numpy as np
 from .config import SAMPLE_RATE
 from .playback_device import AudioOutputStream
 from .protocol import log_event
+from .text import split_clauses
 
 
 async def prefetch_first_chunk(synth, text, voice_name, speed, lang):
-    """Start the TTS stream and fetch the first audio chunk.
+    """Synthesize the first clause of text concurrently with tone playback.
 
-    Returns (stream_iter, first_chunk) where first_chunk is (audio, sr)
-    or (stream_iter, None) if the stream is empty.
+    Splits text into clauses and synthesizes only the first one. Returns
+    (first_audio_chunks, remaining_clauses) where first_audio_chunks is
+    a list of (audio, sr) tuples from the first clause's stream, and
+    remaining_clauses is a list of strings still to be synthesized.
 
-    This allows the caller to kick off TTS synthesis concurrently with
-    other work (e.g. playing a caller tone), so the first speech chunk
-    is ready immediately after the tone finishes.
+    This keeps prefetch fast (~300-500ms) regardless of total text length.
     """
-    stream = synth.kokoro.create_stream(text, voice_name, speed, lang, trim=False)
-    stream_iter = stream.__aiter__()
-    try:
-        first_chunk = await stream_iter.__anext__()
-    except StopAsyncIteration:
-        first_chunk = None
-    return stream_iter, first_chunk
+    t0 = time.monotonic()
+    label = text[:40].replace('\n', ' ')
+
+    clauses = split_clauses(text)
+    if not clauses:
+        print(f"speak-daemon: prefetch_first_chunk EMPTY text=\"{label}\"", file=sys.stderr)
+        return [], []
+
+    first_clause = clauses[0]
+    remaining = clauses[1:]
+
+    print(
+        f"speak-daemon: prefetch_first_chunk STARTED voice={voice_name} "
+        f"clauses={len(clauses)} first=\"{first_clause[:40]}\"",
+        file=sys.stderr,
+    )
+
+    # Synthesize just the first clause
+    first_chunks = []
+    async for audio, sr in synth.kokoro.create_stream(
+        first_clause, voice_name, speed, lang, trim=False
+    ):
+        first_chunks.append((audio, sr))
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    print(
+        f"speak-daemon: prefetch_first_chunk DONE {elapsed_ms:.0f}ms "
+        f"chunks={len(first_chunks)} remaining_clauses={len(remaining)}",
+        file=sys.stderr,
+    )
+    return first_chunks, remaining
 
 
 async def render_speech(
@@ -47,16 +80,16 @@ async def render_speech(
     skip_flag_fn,
     bg_task_tracker,
     prefetch=None,
+    on_first_write=None,
 ) -> None:
-    """Stream speech from Kokoro directly to ffplay.
+    """Stream speech from Kokoro to the audio device, clause by clause.
 
-    Uses Kokoro's create_stream() which handles text splitting
-    internally, preserving natural prosody across clause boundaries.
-    Audio is simultaneously saved to disk for potential replay.
+    If prefetch is provided, it should be (first_chunks, remaining_clauses)
+    from prefetch_first_chunk(). The first clause audio is played immediately,
+    then remaining clauses are synthesized and played sequentially.
 
-    If prefetch is provided, it should be a (stream_iter, first_chunk)
-    tuple from prefetch_first_chunk(). The first chunk is played
-    immediately and the remaining chunks are read from stream_iter.
+    Without prefetch, the full text is split into clauses and each is
+    synthesized independently.
     """
     text = request.get("text", "").strip()
     voice_name = request.get("voice", "af_heart")
@@ -85,7 +118,7 @@ async def render_speech(
     chunk_idx = 0
 
     async def _process_chunk(audio, sr):
-        """Process and play a single audio chunk. Returns audio duration."""
+        """Process and play a single audio chunk."""
         nonlocal total_audio_secs, chunks_done, chunk_idx
 
         # create_stream returns 2D array (1, N) — squeeze to 1D
@@ -106,37 +139,61 @@ async def render_speech(
         log_event("chunk_ready", qid=qid, chunk=chunk_idx + 1,
                   audio_secs=round(dur, 2), audio_bytes=len(pcm))
 
+        # Fire timing callback BEFORE write_pcm so it captures when audio
+        # is ready, not when playback of the full chunk finishes
+        if chunk_idx == 0 and on_first_write is not None:
+            on_first_write()
+
         await ffplay.write_pcm(pcm, skip_flag_fn=skip_flag_fn)
 
         total_audio_secs += dur
         chunks_done += 1
         chunk_idx += 1
 
-        chunk_label = text[:40].replace('\n', ' ')
         print(
             f"speak-daemon: [q#{qid}]   chunk {chunk_idx} "
-            f"audio={dur:.2f}s \"{chunk_label}\"",
+            f"audio={dur:.2f}s",
             file=sys.stderr,
         )
 
+    async def _synthesize_clause(clause):
+        """Synthesize a single clause and play its chunks."""
+        async for audio, sr in synth.kokoro.create_stream(
+            clause, voice_name, speed, lang, trim=False
+        ):
+            if skip_flag_fn():
+                return False
+            await _process_chunk(audio, sr)
+        return True
+
     if prefetch is not None:
-        # Use prefetched stream: play first chunk, then continue iterator
-        stream_iter, first_chunk = prefetch
-        if first_chunk is not None and not skip_flag_fn():
-            await _process_chunk(*first_chunk)
-        # Continue with remaining chunks from the same iterator
-        async for audio, sr in stream_iter:
+        first_chunks, remaining_clauses = prefetch
+
+        # Play prefetched first clause
+        for audio, sr in first_chunks:
             if skip_flag_fn():
-                print(f"speak-daemon: [q#{qid}] SKIPPED after {chunks_done} chunks", file=sys.stderr)
                 break
             await _process_chunk(audio, sr)
+
+        # Synthesize and play remaining clauses
+        if not skip_flag_fn():
+            for clause in remaining_clauses:
+                if skip_flag_fn():
+                    print(f"speak-daemon: [q#{qid}] SKIPPED after {chunks_done} chunks", file=sys.stderr)
+                    break
+                if not await _synthesize_clause(clause):
+                    print(f"speak-daemon: [q#{qid}] SKIPPED after {chunks_done} chunks", file=sys.stderr)
+                    break
     else:
-        # Normal path: create stream from scratch
-        async for audio, sr in synth.kokoro.create_stream(text, voice_name, speed, lang, trim=False):
+        # No prefetch: split into clauses ourselves
+        clauses = split_clauses(text)
+        for clause in clauses:
             if skip_flag_fn():
                 print(f"speak-daemon: [q#{qid}] SKIPPED after {chunks_done} chunks", file=sys.stderr)
                 break
-            await _process_chunk(audio, sr)
+            if not await _synthesize_clause(clause):
+                print(f"speak-daemon: [q#{qid}] SKIPPED after {chunks_done} chunks", file=sys.stderr)
+                break
 
     total_ms = (time.monotonic() - item_t0) * 1000
     proc_alive = ffplay.is_alive

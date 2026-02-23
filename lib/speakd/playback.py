@@ -10,6 +10,7 @@ Skip kills the ffplay process (next write auto-restarts it).
 
 import asyncio
 import sys
+import time
 from typing import Callable
 
 from .playback_device import AudioOutputStream
@@ -191,17 +192,40 @@ class PlaybackQueue:
                 text = request.get("text", "").strip()
                 speed = request.get("speed", 1.0)
                 lang = request.get("lang", "en-us")
+                qid = request.get("_queue_id", "?")
+
+                # --- TIMING instrumentation ---
+                t_prefetch_start = None
+                t_tone_start = None
+                t_tone_done = None
+                t_announce_start = None
+                t_announce_done = None
+                t_publish_start = None
+                t_publish_done = None
+                t_await_prefetch_start = None
+                t_await_prefetch_done = None
+                # This gets set by render_speech via callback
+                t_first_speech_write = None
+
+                def _on_first_speech_write():
+                    nonlocal t_first_speech_write
+                    t_first_speech_write = time.monotonic()
+
                 prefetch_task = None
                 if text:
+                    t_prefetch_start = time.monotonic()
                     prefetch_task = asyncio.create_task(
                         prefetch_first_chunk(self.synth, text, voice_name, speed, lang)
                     )
 
                 # Start tone
+                t_tone_start = time.monotonic()
                 if caller:
                     await self._ffplay.write_pcm(get_caller_tone(caller))
+                t_tone_done = time.monotonic()
 
                 # Announce new voice assignment
+                t_announce_start = time.monotonic()
                 if is_new_claim and caller:
                     import numpy as np
                     announce_text = f"{caller} here"
@@ -215,13 +239,27 @@ class PlaybackQueue:
                                 pcm_samples.astype(np.float32) * gain, -32767, 32767
                             ).astype(np.int16)
                         await self._ffplay.write_pcm(pcm_samples.tobytes())
+                t_announce_done = time.monotonic()
 
+                t_publish_start = time.monotonic()
                 self._publish("playing")
+                t_publish_done = time.monotonic()
 
                 # Await prefetched first chunk (should be ready by now)
                 prefetch = None
                 if prefetch_task is not None:
+                    t_await_prefetch_start = time.monotonic()
                     prefetch = await prefetch_task
+                    t_await_prefetch_done = time.monotonic()
+                    # Log whether prefetch finished before or after the tone
+                    if t_prefetch_start is not None:
+                        prefetch_total_ms = (t_await_prefetch_done - t_prefetch_start) * 1000
+                        await_cost_ms = (t_await_prefetch_done - t_await_prefetch_start) * 1000
+                        print(
+                            f"speak-daemon: [q#{qid}] prefetch total={prefetch_total_ms:.0f}ms "
+                            f"await_cost={await_cost_ms:.0f}ms",
+                            file=sys.stderr,
+                        )
 
                 # The actual speech (uses prefetched first chunk if available)
                 await render_speech(
@@ -229,6 +267,28 @@ class PlaybackQueue:
                     skip_flag_fn=lambda: self._skip_flag,
                     bg_task_tracker=self._bg_task_tracker,
                     prefetch=prefetch,
+                    on_first_write=_on_first_speech_write,
+                )
+
+                # --- TIMING summary ---
+                _ms = lambda a, b: (b - a) * 1000 if (a is not None and b is not None) else 0
+                tone_ms = _ms(t_tone_start, t_tone_done)
+                announce_ms = _ms(t_announce_start, t_announce_done)
+                publish_ms = _ms(t_publish_start, t_publish_done)
+                prefetch_ms = _ms(t_prefetch_start, t_await_prefetch_done) if t_prefetch_start and t_await_prefetch_done else 0
+                await_prefetch_ms = _ms(t_await_prefetch_start, t_await_prefetch_done)
+                gap_ms = _ms(t_tone_done, t_first_speech_write) if t_tone_done and t_first_speech_write else 0
+                first_speech_ms = _ms(t_publish_done, t_first_speech_write) if t_publish_done and t_first_speech_write else 0
+                print(
+                    f"speak-daemon: [q#{qid}] TIMING "
+                    f"tone={tone_ms:.0f}ms "
+                    f"prefetch={prefetch_ms:.0f}ms "
+                    f"await_prefetch={await_prefetch_ms:.0f}ms "
+                    f"announce={announce_ms:.0f}ms "
+                    f"publish={publish_ms:.0f}ms "
+                    f"first_speech={first_speech_ms:.0f}ms "
+                    f"gap(tone->speech)={gap_ms:.0f}ms",
+                    file=sys.stderr,
                 )
 
                 # End tone
