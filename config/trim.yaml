@@ -1,0 +1,15 @@
+# Per-punctuation silence gaps in milliseconds.
+# Total gap between clauses = trail of previous + lead of next,
+# each getting half the configured value for their punctuation.
+# Edits take effect on the next synthesis — no daemon restart needed.
+
+gaps:
+  ".": 300   # period
+  "?": 300   # question mark
+  "!": 300   # exclamation point
+  ":": 220   # colon
+  ";": 220   # semicolon
+  "-": 220   # dash
+  ",": 160   # comma
+
+default_gap: 200  # fallback for unlisted punctuation

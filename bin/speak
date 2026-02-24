@@ -110,7 +110,7 @@ Options:
                       regenerate      Regenerate all rejected via LLM
   -h, --help        Show this help
 
-Trim config (config/trim.json):
+Trim config (config/trim.yaml):
   Controls silence between clauses. Text is split at punctuation and each
   clause is trimmed of Kokoro's built-in silence (~280ms lead, ~360ms trail),
   then re-padded based on the ending punctuation character. Edit the file

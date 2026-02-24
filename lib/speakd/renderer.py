@@ -3,13 +3,12 @@
 Splits text into clauses before synthesis so the first clause can be
 prefetched during caller tone playback. Each clause's audio is trimmed
 of Kokoro's built-in silence padding (~280ms lead, ~360ms trail) and
-replaced with punctuation-appropriate gaps from config/trim.json.
+replaced with punctuation-appropriate gaps from config/trim.yaml.
 
 Config is re-read on every synthesis so edits take effect immediately.
 """
 
 import asyncio
-import json
 import os
 import sys
 import time
@@ -26,19 +25,21 @@ from .text import split_clauses
 _SILENCE_THRESH = 0.001
 
 _TRIM_CONFIG_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "..", "config", "trim.json"
+    os.path.dirname(__file__), "..", "..", "config", "trim.yaml"
 )
 
 
 def _load_trim_config():
-    """Load trim.json, returning (gaps_dict, default_gap_ms)."""
+    """Load trim.yaml, returning (gaps_dict, default_gap_ms)."""
+    import yaml
+
     try:
         with open(_TRIM_CONFIG_PATH) as f:
-            cfg = json.load(f)
+            cfg = yaml.safe_load(f)
         gaps = cfg.get("gaps", {})
         default = cfg.get("default_gap", 200)
         return gaps, default
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, yaml.YAMLError):
         return {}, 200
 
 
