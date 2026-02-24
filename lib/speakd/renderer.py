@@ -1,22 +1,16 @@
-"""Speech rendering with clause-level streaming.
+"""Speech rendering with clause-level streaming and configurable trim.
 
 Splits text into clauses before synthesis so the first clause can be
-prefetched during caller tone playback. Kokoro generates the entire
-utterance as a single chunk when phonemes < 510 (most normal text),
-so without splitting, prefetch has to wait for the whole thing.
+prefetched during caller tone playback. Each clause's audio is trimmed
+of Kokoro's built-in silence padding (~280ms lead, ~360ms trail) and
+replaced with punctuation-appropriate gaps from config/trim.json.
 
-Benchmark data (Kokoro v1.0, Apple M-series):
-  tiny  (7 phonemes):   ~350ms
-  short (24 phonemes):  ~400ms
-  medium(69 phonemes):  ~850ms
-  long  (291 phonemes): ~3500ms
-
-By splitting into clauses, the first clause is typically 5-30 phonemes
-and can be synthesized in 300-500ms — well within the caller tone
-duration (~400-960ms).
+Config is re-read on every synthesis so edits take effect immediately.
 """
 
 import asyncio
+import json
+import os
 import sys
 import time
 from typing import AsyncIterator
@@ -27,6 +21,66 @@ from .config import SAMPLE_RATE
 from .playback_device import AudioOutputStream
 from .protocol import log_event
 from .text import split_clauses
+
+# Silence detection threshold: fraction of peak amplitude
+_SILENCE_THRESH = 0.001
+
+_TRIM_CONFIG_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "..", "config", "trim.json"
+)
+
+
+def _load_trim_config():
+    """Load trim.json, returning (gaps_dict, default_gap_ms)."""
+    try:
+        with open(_TRIM_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        gaps = cfg.get("gaps", {})
+        default = cfg.get("default_gap", 200)
+        return gaps, default
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}, 200
+
+
+def _find_voice_bounds(audio):
+    """Find first and last sample above silence threshold. Returns (start, end) indices."""
+    abs_audio = np.abs(audio)
+    peak = np.max(abs_audio)
+    if peak == 0:
+        return 0, len(audio)
+    threshold = peak * _SILENCE_THRESH
+    above = np.where(abs_audio > threshold)[0]
+    if len(above) == 0:
+        return 0, len(audio)
+    return int(above[0]), int(above[-1]) + 1
+
+
+def trim_clause_audio(audio, split_char, prev_split_char, is_first):
+    """Strip silence from audio and add punctuation-appropriate padding.
+
+    Returns trimmed audio as float32 array.
+    """
+    gaps, default_gap = _load_trim_config()
+
+    start, end = _find_voice_bounds(audio)
+    voice = audio[start:end]
+
+    # Trail padding based on THIS clause's ending punctuation
+    trail_ms = gaps.get(split_char, default_gap) / 2
+    # Lead padding based on PREVIOUS clause's ending punctuation
+    if is_first:
+        lead_ms = 10  # minimal lead on first clause
+    else:
+        lead_ms = gaps.get(prev_split_char, default_gap) / 2
+
+    lead_samples = int(SAMPLE_RATE * lead_ms / 1000)
+    trail_samples = int(SAMPLE_RATE * trail_ms / 1000)
+
+    return np.concatenate([
+        np.zeros(lead_samples, dtype=np.float32),
+        voice,
+        np.zeros(trail_samples, dtype=np.float32),
+    ])
 
 
 async def prefetch_first_chunk(synth, text, voice_name, speed, lang):
@@ -117,17 +171,14 @@ async def render_speech(
     chunks_done = 0
     chunk_idx = 0
 
-    async def _process_chunk(audio, sr):
-        """Process and play a single audio chunk."""
+    prev_split_char = None  # tracks previous clause's ending punctuation
+
+    async def _play_audio(audio):
+        """Convert float32 audio to PCM and write to device."""
         nonlocal total_audio_secs, chunks_done, chunk_idx
 
-        # create_stream returns 2D array (1, N) — squeeze to 1D
-        audio = audio.squeeze()
-
-        # Convert float32 audio to int16 PCM
         pcm_samples = (audio * 32767).astype(np.int16)
 
-        # Apply volume gain
         if gain != 1.0:
             pcm_samples = np.clip(
                 pcm_samples.astype(np.float32) * gain, -32767, 32767
@@ -139,8 +190,6 @@ async def render_speech(
         log_event("chunk_ready", qid=qid, chunk=chunk_idx + 1,
                   audio_secs=round(dur, 2), audio_bytes=len(pcm))
 
-        # Fire timing callback BEFORE write_pcm so it captures when audio
-        # is ready, not when playback of the full chunk finishes
         if chunk_idx == 0 and on_first_write is not None:
             on_first_write()
 
@@ -156,42 +205,71 @@ async def render_speech(
             file=sys.stderr,
         )
 
-    async def _synthesize_clause(clause):
-        """Synthesize a single clause and play its chunks."""
+    def _get_split_char(clause):
+        """Get the trailing punctuation from a clause."""
+        if clause and clause[-1] in ".!?,;:-\u2014":
+            return clause[-1]
+        return ""
+
+    async def _synthesize_and_play_clause(clause, is_first):
+        """Synthesize a clause, trim silence, add punctuation gaps, play."""
+        nonlocal prev_split_char
+
+        split_char = _get_split_char(clause)
+
+        # Collect all audio chunks from this clause into one array
+        clause_audio = []
         async for audio, sr in synth.kokoro.create_stream(
             clause, voice_name, speed, lang, trim=False
         ):
             if skip_flag_fn():
                 return False
-            await _process_chunk(audio, sr)
+            clause_audio.append(audio.squeeze())
+
+        if not clause_audio:
+            return True
+
+        # Concatenate chunks (usually just one for text < 510 phonemes)
+        full_audio = np.concatenate(clause_audio)
+
+        # Trim silence and add punctuation-appropriate padding
+        trimmed = trim_clause_audio(full_audio, split_char, prev_split_char, is_first)
+
+        await _play_audio(trimmed)
+        prev_split_char = split_char
         return True
 
     if prefetch is not None:
         first_chunks, remaining_clauses = prefetch
 
-        # Play prefetched first clause
-        for audio, sr in first_chunks:
-            if skip_flag_fn():
-                break
-            await _process_chunk(audio, sr)
+        if first_chunks and not skip_flag_fn():
+            # Get split char from the first clause text
+            all_clauses = split_clauses(text)
+            first_clause_text = all_clauses[0] if all_clauses else ""
+            split_char = _get_split_char(first_clause_text)
 
-        # Synthesize and play remaining clauses
+            # Concatenate prefetched audio and trim
+            full_audio = np.concatenate([a.squeeze() for a, sr in first_chunks])
+            trimmed = trim_clause_audio(full_audio, split_char, None, is_first=True)
+            await _play_audio(trimmed)
+            prev_split_char = split_char
+
+        # Synthesize remaining clauses
         if not skip_flag_fn():
-            for clause in remaining_clauses:
+            for i, clause in enumerate(remaining_clauses):
                 if skip_flag_fn():
                     print(f"speak-daemon: [q#{qid}] SKIPPED after {chunks_done} chunks", file=sys.stderr)
                     break
-                if not await _synthesize_clause(clause):
+                if not await _synthesize_and_play_clause(clause, is_first=False):
                     print(f"speak-daemon: [q#{qid}] SKIPPED after {chunks_done} chunks", file=sys.stderr)
                     break
     else:
-        # No prefetch: split into clauses ourselves
         clauses = split_clauses(text)
-        for clause in clauses:
+        for i, clause in enumerate(clauses):
             if skip_flag_fn():
                 print(f"speak-daemon: [q#{qid}] SKIPPED after {chunks_done} chunks", file=sys.stderr)
                 break
-            if not await _synthesize_clause(clause):
+            if not await _synthesize_and_play_clause(clause, is_first=(i == 0)):
                 print(f"speak-daemon: [q#{qid}] SKIPPED after {chunks_done} chunks", file=sys.stderr)
                 break
 

@@ -95,6 +95,8 @@ Options:
   --voice-release VOICE    Release active claims on a voice (daemon reassigns on next enqueue)
   --voice-reject VOICE     Deprioritize a voice and release its claims in one step
   --voice-keep             Lock the agent's current pool-assigned voice permanently
+  --subscribe       Subscribe to real-time PCM audio stream (stdout) + metadata (stderr)
+  --session PID     Set session PID for history tracking (used with --enqueue)
   --rewrites CMD    Manage pronunciation/phrase rewrites:
                       list            Show all rewrites with review status
                       pending         Show unreviewed entries
@@ -107,6 +109,23 @@ Options:
                       review [F]      Re-speak by status (accepted/rejected/...)
                       regenerate      Regenerate all rejected via LLM
   -h, --help        Show this help
+
+Trim config (config/trim.json):
+  Controls silence between clauses. Text is split at punctuation and each
+  clause is trimmed of Kokoro's built-in silence (~280ms lead, ~360ms trail),
+  then re-padded based on the ending punctuation character. Edit the file
+  to change values — takes effect on the next synthesis, no restart needed.
+
+  Default values:
+    . ? !  = 300ms gap (sentence endings)
+    : ; -  = 220ms gap (mid-sentence breaks)
+    ,      = 160ms gap (list items, clauses)
+
+Broadcast subscribe:
+  Clients can subscribe to receive a copy of all audio + metadata events.
+  PCM format: signed 16-bit LE mono at 24kHz.
+  Use speak-client --subscribe to connect, or send {"command":"subscribe"}
+  over the daemon socket.
 
 Kokoro voices (prefix: af_=American female, am_=American male, bf_/bm_=British):
   af_heart, af_sarah, af_bella, af_nova, af_sky, af_nicole, af_alloy, ...
@@ -121,6 +140,9 @@ Examples:
   speak --save output.wav "Saved to file"
   speak --voices
   speak --enqueue "first" && speak --enqueue "second"
+  speak --enqueue --caller agent1 "With caller tone"
+  speak --agent-summary 12345
+  speak --agent-repeat 12345 5
   speak --queue
   speak --skip
   speak --clear

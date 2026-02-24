@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Analyze silence at the start and end of Kokoro TTS audio chunks.
+
+Generates audio for many short clauses, saves each as a WAV file,
+then measures the leading/trailing silence in each. This tells us
+how much dead air Kokoro adds per chunk and whether we can trim it.
+
+Run:
+  uv run --python 3.14 --with kokoro-onnx --with soundfile -- python3 bin/bench-silence
+
+Output:
+  /tmp/speak-clause-analysis/*.wav   — individual audio files
+  /tmp/speak-clause-analysis/report.txt — silence analysis
+"""
+
+import asyncio
+import os
+import sys
+import time
+
+import numpy as np
+
+# Add project root for monkeypatch
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+
+MODEL = os.path.expanduser("~/.local/share/speak/kokoro/kokoro-v1.0.onnx")
+VOICES = os.path.expanduser("~/.local/share/speak/kokoro/voices-v1.0.bin")
+VOICE = "af_heart"
+SPEED = 1.26
+LANG = "en-us"
+SAMPLE_RATE = 24000
+OUT_DIR = "/tmp/speak-clause-analysis"
+
+# Threshold in dB below peak to consider "silence"
+SILENCE_THRESHOLD_DB = -40
+
+CLAUSES = [
+    "Hello.",
+    "Testing one two three.",
+    "The quick brown fox jumps over the lazy dog.",
+    "Good morning.",
+    "This is a short clause,",
+    "and here is the next part.",
+    "Filed as speak 788,",
+    "priority 2.",
+    "Five possible approaches listed:",
+    "extend the tone dynamically until speech is ready,",
+    "pre-phonemize at enqueue time,",
+    "reduce the first chunk size,",
+    "warm the cache in background,",
+    "or fill the gap with an intentional sound.",
+    "Done.",
+]
+
+
+def measure_silence(audio, sr, threshold_db=SILENCE_THRESHOLD_DB):
+    """Measure leading and trailing silence in an audio array.
+
+    Returns (leading_ms, trailing_ms, total_ms, voice_start_ms, voice_end_ms)
+    """
+    audio = audio.squeeze()
+    total_ms = len(audio) / sr * 1000
+
+    # Convert to amplitude envelope (absolute values)
+    abs_audio = np.abs(audio)
+
+    # Find threshold in linear scale relative to peak
+    peak = np.max(abs_audio)
+    if peak == 0:
+        return total_ms, 0.0, total_ms, 0.0, 0.0
+
+    threshold_linear = peak * (10 ** (threshold_db / 20))
+
+    # Find first sample above threshold
+    above = np.where(abs_audio > threshold_linear)[0]
+    if len(above) == 0:
+        return total_ms, 0.0, total_ms, 0.0, 0.0
+
+    first_voice = above[0]
+    last_voice = above[-1]
+
+    leading_ms = first_voice / sr * 1000
+    trailing_ms = (len(audio) - last_voice - 1) / sr * 1000
+    voice_start_ms = first_voice / sr * 1000
+    voice_end_ms = last_voice / sr * 1000
+
+    return leading_ms, trailing_ms, total_ms, voice_start_ms, voice_end_ms
+
+
+async def main():
+    import soundfile as sf
+    from kokoro_onnx import Kokoro
+    from speakd.kokoro_patch import apply_patch
+
+    apply_patch()
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    print("Loading model...")
+    k = Kokoro(MODEL, VOICES)
+    print(f"Model loaded.\n")
+
+    # Generate with trim=False (what our daemon uses) and trim=True for comparison
+    results = []
+
+    for trim_mode in [False, True]:
+        mode_label = "raw" if not trim_mode else "trimmed"
+        print(f"\n=== Mode: {mode_label} (trim={trim_mode}) ===")
+        print(f"{'#':>3} {'clause':40s} {'lead_ms':>8} {'trail_ms':>8} {'total_ms':>9} {'voice_ms':>9}")
+        print("-" * 82)
+
+        for i, clause in enumerate(CLAUSES):
+            # Use create (not create_stream) for simplicity — same ONNX call
+            audio, sr = k.create(clause, VOICE, SPEED, LANG, trim=trim_mode)
+            audio = audio.squeeze()
+
+            # Save WAV
+            fname = f"{i:02d}_{mode_label}_{clause[:30].replace(' ', '_').replace(',', '').replace('.', '')}.wav"
+            fpath = os.path.join(OUT_DIR, fname)
+            sf.write(fpath, audio, sr)
+
+            # Measure silence
+            lead, trail, total, vstart, vend = measure_silence(audio, sr)
+            voice_dur = vend - vstart
+
+            results.append({
+                "idx": i,
+                "mode": mode_label,
+                "clause": clause,
+                "file": fname,
+                "leading_ms": lead,
+                "trailing_ms": trail,
+                "total_ms": total,
+                "voice_ms": voice_dur,
+            })
+
+            print(f"{i:3d} {clause:40s} {lead:7.0f}ms {trail:7.0f}ms {total:8.0f}ms {voice_dur:8.0f}ms")
+
+    # Summary
+    print(f"\n\n=== SUMMARY ===")
+    for mode in ["raw", "trimmed"]:
+        mode_results = [r for r in results if r["mode"] == mode]
+        leads = [r["leading_ms"] for r in mode_results]
+        trails = [r["trailing_ms"] for r in mode_results]
+        print(f"\n{mode}:")
+        print(f"  Leading silence:  min={min(leads):.0f}ms  max={max(leads):.0f}ms  avg={sum(leads)/len(leads):.0f}ms")
+        print(f"  Trailing silence: min={min(trails):.0f}ms  max={max(trails):.0f}ms  avg={sum(trails)/len(trails):.0f}ms")
+        print(f"  Combined per-clause gap (trail + next lead): avg={sum(trails)/len(trails) + sum(leads)/len(leads):.0f}ms")
+
+    # Write report
+    report_path = os.path.join(OUT_DIR, "report.txt")
+    with open(report_path, "w") as f:
+        f.write("Kokoro TTS Silence Analysis\n")
+        f.write(f"Voice: {VOICE}, Speed: {SPEED}, Threshold: {SILENCE_THRESHOLD_DB}dB\n\n")
+        for r in results:
+            f.write(f"[{r['mode']}] {r['clause']}\n")
+            f.write(f"  lead={r['leading_ms']:.0f}ms trail={r['trailing_ms']:.0f}ms total={r['total_ms']:.0f}ms voice={r['voice_ms']:.0f}ms\n")
+            f.write(f"  file: {r['file']}\n\n")
+
+    print(f"\nFiles saved to {OUT_DIR}/")
+    print(f"Report: {report_path}")
+    print(f"\nListen to concatenated raw files:")
+    print(f"  ffplay -f s16le -ar 24000 -ac 1 <(cat {OUT_DIR}/??_raw_*.wav)")
+    print(f"Or open individual files in any audio player.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

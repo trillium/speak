@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Generate a markdown report showing clause splitting and per-segment silence
+across all trim modes.
+
+Run:
+  uv run --python 3.14 --with kokoro-onnx --with soundfile -- python3 bin/bench-silence-report
+"""
+
+import asyncio
+import os
+import re
+import subprocess
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+
+MODEL = os.path.expanduser("~/.local/share/speak/kokoro/kokoro-v1.0.onnx")
+VOICES = os.path.expanduser("~/.local/share/speak/kokoro/voices-v1.0.bin")
+VOICE = "af_heart"
+SPEED = 1.26
+LANG = "en-us"
+OUT_DIR = "/tmp/speak-clause-analysis"
+
+FULL_TEXT = (
+    "This is a list: item 1, item 2, item 3, item 4, ending item then period. "
+    "I will insert a dash into this sentence in a moment here it comes - that was it, how did that go? "
+    "Different punctuation. Question mark? Exclamation point! Period."
+)
+
+_CLAUSE_RE = re.compile(r'(?<=[.!?,;:\u2014\u2014-])\s+')
+
+# Trim modes: (label, description, sox_processing)
+# sox_processing can be:
+#   None          = raw (no processing)
+#   "kokoro"      = Kokoro trim=True
+#   (lead, trail) = fixed padding after stripping silence
+#   "variable"    = per-punctuation variable padding (dict below)
+TRIM_MODES = [
+    ("raw",         "No trimming (trim=False)",       None),
+    ("kokoro_trim", "Kokoro built-in (trim=True)",    "kokoro"),
+    ("pad_200ms",   "Strip silence, pad 100ms/100ms", (0.100, 0.100)),
+    ("pad_300ms",   "Strip silence, pad 150ms/150ms", (0.150, 0.150)),
+    ("variable_a",  "Variable: . ? ! =350ms  : ; - =250ms  , =160ms", "variable_a"),
+    ("variable_b",  "Variable: . ? ! =300ms  : ; - =220ms  , =160ms", "variable_b"),
+    ("variable_c",  "Variable: . ? ! =280ms  : ; - =200ms  , =160ms", "variable_c"),
+]
+
+# Variable padding configs: split_char -> (lead_ms, trail_ms)
+# Lead is padding before the NEXT clause, trail is padding after the CURRENT clause
+# We apply half to trail of current, half to lead of next
+VARIABLE_CONFIGS = {
+    "variable_a": {
+        ".": 350, "?": 350, "!": 350,
+        ":": 250, ";": 250, "-": 250,
+        ",": 160,
+    },
+    "variable_b": {
+        ".": 300, "?": 300, "!": 300,
+        ":": 220, ";": 220, "-": 220,
+        ",": 160,
+    },
+    "variable_c": {
+        ".": 280, "?": 280, "!": 280,
+        ":": 200, ";": 200, "-": 200,
+        ",": 160,
+    },
+}
+
+# This is a list: item 1, item 2, item 3, item 4, ending item then period.
+# I will insert a dash into this setence in a moment here it comes - that was it, how did that go?
+# Different punctuation. Question mark? Excalamation point! Period. 
+
+
+def split_with_info(text):
+    parts = _CLAUSE_RE.split(text.strip())
+    parts = [s.strip() for s in parts if s.strip()]
+    results = []
+    for p in parts:
+        last_char = p[-1] if p else ""
+        if last_char in ".!?,;:-\u2014":
+            split_char = last_char
+        else:
+            split_char = "(end)"
+        results.append((p, split_char))
+    return results
+
+
+def measure_silence_sox(wav_path):
+    total = float(subprocess.check_output(
+        ["soxi", "-D", wav_path], stderr=subprocess.DEVNULL
+    ).strip())
+
+    tmp_front = wav_path + ".tmp_front.wav"
+    subprocess.run(
+        ["sox", wav_path, tmp_front, "silence", "1", "0.001", "0.1%"],
+        stderr=subprocess.DEVNULL,
+    )
+    after_lead = float(subprocess.check_output(
+        ["soxi", "-D", tmp_front], stderr=subprocess.DEVNULL
+    ).strip())
+    lead = total - after_lead
+
+    tmp_rev = wav_path + ".tmp_rev.wav"
+    tmp_revtrim = wav_path + ".tmp_revtrim.wav"
+    subprocess.run(
+        ["sox", wav_path, tmp_rev, "reverse"], stderr=subprocess.DEVNULL
+    )
+    subprocess.run(
+        ["sox", tmp_rev, tmp_revtrim, "silence", "1", "0.001", "0.1%"],
+        stderr=subprocess.DEVNULL,
+    )
+    after_trail = float(subprocess.check_output(
+        ["soxi", "-D", tmp_revtrim], stderr=subprocess.DEVNULL
+    ).strip())
+    trail = total - after_trail
+    voice = total - lead - trail
+
+    for f in [tmp_front, tmp_rev, tmp_revtrim]:
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+
+    return lead, voice, trail, total
+
+
+def apply_sox_trim(in_wav, out_wav, lead_pad, trail_pad):
+    """Strip all silence then add fixed padding."""
+    subprocess.run(
+        ["sox", in_wav, out_wav,
+         "silence", "1", "0.001", "0.1%",
+         "reverse", "silence", "1", "0.001", "0.1%", "reverse",
+         "pad", f"{lead_pad:.3f}", f"{trail_pad:.3f}"],
+        stderr=subprocess.DEVNULL,
+    )
+
+
+async def main():
+    import soundfile as sf
+    from kokoro_onnx import Kokoro
+    from speakd.kokoro_patch import apply_patch
+
+    apply_patch()
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    k = Kokoro(MODEL, VOICES)
+    clauses = split_with_info(FULL_TEXT)
+
+    # Step 1: Generate raw WAVs for each clause (trim=False)
+    raw_wavs = []
+    for i, (clause, _) in enumerate(clauses):
+        audio, sr = k.create(clause, VOICE, SPEED, LANG, trim=False)
+        wav_path = os.path.join(OUT_DIR, f"seg_{i:02d}_raw.wav")
+        sf.write(wav_path, audio.squeeze(), sr)
+        raw_wavs.append(wav_path)
+
+    # Step 1b: Generate Kokoro-trimmed WAVs (trim=True)
+    kokoro_wavs = []
+    for i, (clause, _) in enumerate(clauses):
+        audio, sr = k.create(clause, VOICE, SPEED, LANG, trim=True)
+        wav_path = os.path.join(OUT_DIR, f"seg_{i:02d}_kokoro_trim.wav")
+        sf.write(wav_path, audio.squeeze(), sr)
+        kokoro_wavs.append(wav_path)
+
+    # Step 2: For each trim mode, generate processed WAVs and measure
+    all_mode_data = {}
+
+    for mode_name, mode_desc, mode_proc in TRIM_MODES:
+        measurements = []
+        for i, (clause, split_char) in enumerate(clauses):
+            if mode_proc is None:
+                # raw — use as-is
+                wav = raw_wavs[i]
+            elif mode_proc == "kokoro":
+                # Kokoro trim=True
+                wav = kokoro_wavs[i]
+            elif isinstance(mode_proc, tuple):
+                # Fixed padding
+                lead_pad, trail_pad = mode_proc
+                wav = os.path.join(OUT_DIR, f"seg_{i:02d}_{mode_name}.wav")
+                apply_sox_trim(raw_wavs[i], wav, lead_pad, trail_pad)
+            elif mode_proc.startswith("variable"):
+                # Variable padding based on punctuation
+                config = VARIABLE_CONFIGS[mode_proc]
+                gap_ms = config.get(split_char, 150)  # default 150ms
+                # Split gap: half as trail on this clause, half as lead on this clause
+                # (each clause gets its own trail based on its split char,
+                #  and its lead based on the previous clause's split char)
+                trail_pad = gap_ms / 2 / 1000
+                # For lead: use previous clause's split char
+                if i == 0:
+                    lead_pad = 0.020  # minimal lead on first clause
+                else:
+                    prev_char = clauses[i - 1][1]
+                    prev_gap = config.get(prev_char, 150)
+                    lead_pad = prev_gap / 2 / 1000
+                wav = os.path.join(OUT_DIR, f"seg_{i:02d}_{mode_name}.wav")
+                apply_sox_trim(raw_wavs[i], wav, lead_pad, trail_pad)
+            else:
+                wav = raw_wavs[i]
+
+            lead, voice, trail, total = measure_silence_sox(wav)
+            measurements.append({
+                "idx": i,
+                "clause": clause,
+                "split_char": split_char,
+                "lead": lead,
+                "voice": voice,
+                "trail": trail,
+                "total": total,
+            })
+        all_mode_data[mode_name] = (mode_desc, measurements)
+
+    # Step 3: Generate full unsplit for reference
+    audio_full, sr = k.create(FULL_TEXT, VOICE, SPEED, LANG, trim=False)
+    full_wav = os.path.join(OUT_DIR, "full_unsplit.wav")
+    sf.write(full_wav, audio_full.squeeze(), sr)
+    full_lead, full_voice, full_trail, full_total = measure_silence_sox(full_wav)
+
+    # Step 4: Write report
+    report_path = os.path.join(OUT_DIR, "silence-report.md")
+    with open(report_path, "w") as f:
+        f.write("# Clause Splitting & Silence Report\n\n")
+
+        f.write("## Full Input Text\n\n")
+        f.write(f"```\n{FULL_TEXT}\n```\n\n")
+        f.write(f"Voice: `{VOICE}`  Speed: `{SPEED}`\n\n")
+
+        f.write("## Full Text (unsplit, single synthesis, trim=False)\n\n")
+        f.write(f"```\n")
+        f.write(f"Total: {full_total:.3f}s   Lead: {full_lead:.3f}s   Voice: {full_voice:.3f}s   Trail: {full_trail:.3f}s\n")
+        f.write(f"```\n\n")
+
+        f.write("## How Splitting Works\n\n")
+        f.write(f"Split regex: `(?<=[.!?,;:\\u2014—-])\\s+`\n\n")
+        f.write(f"Splits **after** punctuation followed by whitespace. ")
+        f.write(f"Punctuation stays attached to the clause before it.\n\n")
+
+        # Per-mode tables
+        for mode_name, (mode_desc, measurements) in all_mode_data.items():
+            n = len(measurements)
+            total_lead = sum(m["lead"] for m in measurements)
+            total_voice = sum(m["voice"] for m in measurements)
+            total_trail = sum(m["trail"] for m in measurements)
+            avg_gap = total_lead / n + total_trail / n
+            concat_total = total_lead + total_voice + total_trail
+
+            f.write(f"## {mode_name}: {mode_desc}\n\n")
+            f.write(f"Avg inter-clause gap: **{avg_gap*1000:.0f}ms**   ")
+            f.write(f"Concatenated total: **{concat_total:.1f}s**\n\n")
+
+            # Show variable config if applicable
+            if mode_name in VARIABLE_CONFIGS:
+                cfg = VARIABLE_CONFIGS[mode_name]
+                f.write(f"Gap by punctuation: ")
+                seen = {}
+                for ch, ms in sorted(cfg.items(), key=lambda x: -x[1]):
+                    if ms not in seen:
+                        chars = [c for c, m in cfg.items() if m == ms]
+                        f.write(f"`{'` `'.join(chars)}` = {ms}ms   ")
+                        seen[ms] = True
+                f.write("\n\n")
+
+            f.write("```\n")
+            f.write(f"{'#':>3}  {'Split':>5}  {'Lead':>7}  {'Voice':>7}  {'Trail':>7}  {'Total':>7}  {'Gap':>5}  Clause\n")
+            f.write(f"{'':>3}  {'Char':>5}  {'(sec)':>7}  {'(sec)':>7}  {'(sec)':>7}  {'(sec)':>7}  {'(ms)':>5}\n")
+            f.write(f"---  -----  -------  -------  -------  -------  -----  {'':->50}\n")
+
+            for m in measurements:
+                sc = repr(m["split_char"]) if m["split_char"] != "(end)" else "(end)"
+                # Show the target gap for this punctuation
+                if mode_name in VARIABLE_CONFIGS:
+                    gap_target = VARIABLE_CONFIGS[mode_name].get(m["split_char"], "?")
+                    gap_str = f"{gap_target:5}"
+                else:
+                    gap_str = "    -"
+                f.write(
+                    f"{m['idx']:3d}  {sc:>5}  "
+                    f"{m['lead']:7.3f}  {m['voice']:7.3f}  {m['trail']:7.3f}  {m['total']:7.3f}  "
+                    f"{gap_str}  "
+                    f"{m['clause']}\n"
+                )
+
+            f.write(f"---  -----  -------  -------  -------  -------\n")
+            f.write(
+                f"AVG  {'':>5}  "
+                f"{total_lead/n:7.3f}  {total_voice/n:7.3f}  {total_trail/n:7.3f}\n"
+            )
+            f.write(
+                f"SUM  {'':>5}  "
+                f"{total_lead:7.3f}  {total_voice:7.3f}  {total_trail:7.3f}  "
+                f"{concat_total:7.3f}\n"
+            )
+            f.write("```\n\n")
+
+        # Summary comparison table
+        f.write("## Comparison Summary\n\n")
+        f.write("```\n")
+        f.write(f"{'Mode':<15}  {'Avg Gap':>8}  {'Total':>7}  Description\n")
+        f.write(f"{'':->15}  {'':->8}  {'':->7}  {'':->40}\n")
+        for mode_name, (mode_desc, measurements) in all_mode_data.items():
+            n = len(measurements)
+            tl = sum(m["lead"] for m in measurements)
+            tt = sum(m["trail"] for m in measurements)
+            tv = sum(m["voice"] for m in measurements)
+            avg_gap = tl / n + tt / n
+            concat = tl + tv + tt
+            f.write(f"{mode_name:<15}  {avg_gap*1000:7.0f}ms  {concat:6.1f}s  {mode_desc}\n")
+        f.write("```\n")
+
+    # Step 5: Generate A/B listening test with spoken labels
+    sox_path = "sox"
+
+    # Spoken labels for each mode (short, clear announcements)
+    SPOKEN_LABELS = {
+        "raw":         "Raw mode. No trimming.",
+        "kokoro_trim": "Kokoro trim mode.",
+        "pad_200ms":   "Fixed 200 millisecond gap.",
+        "pad_300ms":   "Fixed 300 millisecond gap.",
+        "variable_a":  "Variable A. Periods 350, colons 250, commas 160.",
+        "variable_b":  "Variable B. Periods 300, colons 220, commas 160.",
+        "variable_c":  "Variable C. Periods 280, colons 200, commas 160.",
+    }
+
+    # Generate spoken label WAVs (using Kokoro, trimmed tight)
+    print("Generating spoken labels...")
+    for mode_name, label_text in SPOKEN_LABELS.items():
+        audio, sr = k.create(label_text, VOICE, SPEED, LANG, trim=True)
+        label_wav = os.path.join(OUT_DIR, f"label_{mode_name}.wav")
+        sf.write(label_wav, audio.squeeze(), sr)
+
+    # Separator tone between modes
+    tone_path = os.path.join(OUT_DIR, "tone_sep.wav")
+    subprocess.run(
+        [sox_path, "-n", "-r", "24000", "-c", "1", tone_path,
+         "synth", "0.4", "sine", "800", "gain", "-10",
+         "fade", "0.05", "0.4", "0.05"],
+        stderr=subprocess.DEVNULL,
+    )
+    # Silence padding
+    silence_path = os.path.join(OUT_DIR, "silence_pad.wav")
+    subprocess.run(
+        [sox_path, "-n", "-r", "24000", "-c", "1", silence_path,
+         "trim", "0", "0.3"],
+        stderr=subprocess.DEVNULL,
+    )
+
+    # For each mode: label + silence + segments concatenated
+    for mode_name, mode_desc, mode_proc in TRIM_MODES:
+        seg_files = []
+        for i in range(len(clauses)):
+            if mode_proc is None:
+                seg_files.append(os.path.join(OUT_DIR, f"seg_{i:02d}_raw.wav"))
+            elif mode_proc == "kokoro":
+                seg_files.append(os.path.join(OUT_DIR, f"seg_{i:02d}_kokoro_trim.wav"))
+            else:
+                seg_files.append(os.path.join(OUT_DIR, f"seg_{i:02d}_{mode_name}.wav"))
+
+        label_wav = os.path.join(OUT_DIR, f"label_{mode_name}.wav")
+        concat_path = os.path.join(OUT_DIR, f"all_{mode_name}.wav")
+        subprocess.run(
+            [sox_path, label_wav, silence_path] + seg_files + [concat_path],
+            stderr=subprocess.DEVNULL,
+        )
+
+    # Master A/B test: all modes back to back with tones
+    ab_parts = []
+    for mode_name, _, _ in TRIM_MODES:
+        if ab_parts:
+            ab_parts.extend([tone_path, silence_path])
+        ab_parts.append(os.path.join(OUT_DIR, f"all_{mode_name}.wav"))
+
+    ab_path = os.path.join(OUT_DIR, "ab_test_all_modes.wav")
+    subprocess.run(
+        [sox_path] + ab_parts + [ab_path],
+        stderr=subprocess.DEVNULL,
+    )
+
+    print(f"Report written to {report_path}")
+    print(f"A/B test: {ab_path}")
+    return report_path
+
+
+if __name__ == "__main__":
+    path = asyncio.run(main())
+    subprocess.run(["code", path])
