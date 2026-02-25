@@ -82,6 +82,8 @@ Options:
   --skip            Skip currently playing queued item
   --clear           Clear pending playback queue
   --replay          Replay the last queued item
+  --pause           Toggle pause/resume on current playback
+  --resume          Explicitly resume paused playback
   --stats           Show daemon stats (uptime, cache, queue totals)
   --caller NAME     Caller identity (plays a unique tone per caller)
   --history [N]     Show last N spoken texts as JSON array (default: 10)
@@ -267,6 +269,8 @@ while [[ $# -gt 0 ]]; do
         --skip)       QUEUE_CMD="skip"; shift ;;
         --clear)      QUEUE_CMD="clear"; shift ;;
         --replay)     QUEUE_CMD="replay"; shift ;;
+        --pause)      QUEUE_CMD="toggle_pause"; shift ;;
+        --resume)     QUEUE_CMD="resume"; shift ;;
         --stats)      QUEUE_CMD="stats"; shift ;;
         --history)
             HISTORY_N="${2:-10}"; shift

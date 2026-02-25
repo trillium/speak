@@ -69,6 +69,12 @@ class SpeakDaemon:
                     result = await self.playback_queue.clear()
                 elif command == "queue_status":
                     result = self.playback_queue.status()
+                elif command == "pause":
+                    result = await self.playback_queue.pause()
+                elif command == "resume":
+                    result = self.playback_queue.resume()
+                elif command == "toggle_pause":
+                    result = await self.playback_queue.toggle_pause()
                 elif command == "replay":
                     result = await self.playback_queue.replay()
                 elif command == "stats":
@@ -283,6 +289,17 @@ class SpeakDaemon:
 
         self.playback_queue.start()
         asyncio.create_task(self.idle_watchdog())
+
+        # Announce startup so the user knows the daemon is ready
+        await self.playback_queue.enqueue({
+            "text": "Speak daemon ready.",
+            "enqueue": True,
+            "voice": "af_heart",
+            "speed": 1.26,
+            "lang": "en-us",
+            "caller": "",
+            "session": "",
+        })
 
         async with server:
             await server.serve_forever()

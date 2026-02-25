@@ -56,6 +56,9 @@ class PlaybackQueue:
         self.total_completed = 0
         self.total_skipped = 0
         self._history = SpeechHistory()
+        self._paused = False
+        self._resume_event = asyncio.Event()
+        self._resume_event.set()  # starts unblocked
 
     def record_history(self, text: str, caller: str = "", session: str = ""):
         self._history.record(text, caller=caller, session=session)
@@ -78,7 +81,7 @@ class PlaybackQueue:
 
     @property
     def is_active(self) -> bool:
-        return self._current is not None or not self._queue.empty()
+        return self._current is not None or not self._queue.empty() or self._paused
 
     async def enqueue(self, request: dict) -> int:
         self._id_counter += 1
@@ -88,8 +91,50 @@ class PlaybackQueue:
         self._publish("enqueued", enqueued_id=self._id_counter)
         return self._queue.qsize()
 
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    async def pause(self) -> dict:
+        """Pause: block the worker from playing. If mid-utterance, stop and stash for replay."""
+        if self._paused:
+            return {"ok": True, "already_paused": True}
+        self._paused = True
+        # Block the worker from pulling the next item
+        self._resume_event.clear()
+        # If something is currently playing, stop it (will be stashed in finally block)
+        if self._current:
+            self._skip_flag = True
+            await self._ffplay.kill(force=True)
+        self._publish("paused")
+        return {"ok": True}
+
+    def resume(self) -> dict:
+        """Resume: unblock the worker so the re-enqueued item plays."""
+        if not self._paused:
+            return {"ok": True, "already_playing": True}
+        self._paused = False
+        self._resume_event.set()
+        self._publish("resumed")
+        return {"ok": True}
+
+    async def toggle_pause(self) -> dict:
+        """Toggle between paused and playing."""
+        if self._paused:
+            return self.resume()
+        return await self.pause()
+
     async def skip(self) -> dict:
-        """Skip current item by killing ffplay. Next write restarts it."""
+        """Skip current item by killing ffplay. Next write restarts it.
+
+        While paused: discards the stashed replay item but stays paused.
+        """
+        if self._paused and self._paused_request is not None:
+            skipped_text = self._paused_request.get("text", "")[:80]
+            self._paused_request = None
+            self.total_skipped += 1
+            self._publish("skipped")
+            return {"ok": True, "skipped": skipped_text}
         if self._current:
             self._skip_flag = True
             self.total_skipped += 1
@@ -129,11 +174,18 @@ class PlaybackQueue:
                 "id": item.get("_queue_id"),
                 "text": item.get("text", "")[:80],
             })
-        result = {"pending": len(pending), "items": pending}
+        result = {"pending": len(pending), "items": pending,
+                  "paused": self._paused}
         if self._current:
             result["playing"] = {
                 "id": self._current.get("_queue_id"),
                 "text": self._current.get("text", "")[:80],
+            }
+        elif self._paused and self._paused_request is not None:
+            result["playing"] = {
+                "id": self._paused_request.get("_queue_id"),
+                "text": self._paused_request.get("text", "")[:80],
+                "paused": True,
             }
         return result
 
@@ -144,6 +196,7 @@ class PlaybackQueue:
             "event": event,
             "playing": None,
             "pending": len(pending),
+            "paused": self._paused,
             "queue": [{"id": r.get("_queue_id"), "caller": r.get("caller", ""),
                        "text": r.get("text", "")[:120]} for r in pending],
         }
@@ -162,13 +215,32 @@ class PlaybackQueue:
     async def _worker(self):
         loop = asyncio.get_event_loop()
         self._publish("idle")
+        self._paused_request = None  # holds item to replay after resume
         while True:
-            request = await self._queue.get()
+            # Paused item gets priority over queue
+            if self._paused_request is not None:
+                # Wait for resume before replaying stashed item
+                await self._resume_event.wait()
+                request = self._paused_request
+                self._paused_request = None
+            else:
+                # Wait for resume before pulling from queue, so items stay
+                # visible to clear() while paused. Also check again after
+                # pulling in case pause was set while waiting on queue.get().
+                await self._resume_event.wait()
+                request = await self._queue.get()
+                if not self._resume_event.is_set():
+                    # Paused while we were waiting — stash and loop back
+                    self._paused_request = request
+                    request["_is_resume"] = True
+                    continue
             self._current = request
             self._skip_flag = False
+            is_resume = request.get("_is_resume", False)
             # Record in history early so queries see it before playback finishes
+            # (but not on resume — already recorded)
             text_for_history = request.get("text", "")
-            if text_for_history:
+            if text_for_history and not is_resume:
                 self.record_history(
                     text_for_history,
                     caller=request.get("caller", ""),
@@ -316,11 +388,17 @@ class PlaybackQueue:
             except Exception as e:
                 print(f"speak-daemon: queue playback error: {e}", file=sys.stderr)
             finally:
+                # If this was a pause, stash the item for replay on resume
+                if self._paused:
+                    request["_is_resume"] = True
+                    self._paused_request = request
+                    print(f"speak-daemon: paused — will replay on resume", file=sys.stderr)
+
                 self._current = None
                 self._on_activity()
                 # Reset separator counter when queue drains, and kill ffplay
                 # so next batch gets a fresh audio device (handles device changes)
-                if self._queue.empty():
+                if self._queue.empty() and not self._paused:
                     self._items_played = 0
                     await self._ffplay.kill()
                     self._publish("idle")
