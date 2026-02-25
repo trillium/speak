@@ -85,6 +85,8 @@ Options:
   --stats           Show daemon stats (uptime, cache, queue totals)
   --caller NAME     Caller identity (plays a unique tone per caller)
   --history [N]     Show last N spoken texts as JSON array (default: 10)
+  --caller-history NAME [N]  Show last N texts from a specific caller (default: 10)
+  --session-history PID [N]  Show last N texts from a session PID (default: 10)
   --agent-summary PID  Summarize what a Claude Code session (by PID) has said
   --agent-repeat PID [N]  Replay last N things a session said (default: 3)
   --flag WORD/PHRASE  Flag a word or phrase that sounds wrong (triage later)
@@ -275,6 +277,32 @@ while [[ $# -gt 0 ]]; do
                 HISTORY_N=10
             fi
             QUEUE_CMD="history"
+            ;;
+        --caller-history)
+            CALLER_HISTORY_NAME="${2:-}"
+            if [[ -z "${CALLER_HISTORY_NAME}" ]]; then
+                echo "speak: --caller-history requires a caller name" >&2; exit 1
+            fi
+            shift 2
+            CALLER_HISTORY_N="${1:-10}"
+            if [[ "${CALLER_HISTORY_N}" =~ ^[0-9]+$ ]]; then
+                shift 2>/dev/null || true
+            else
+                CALLER_HISTORY_N=10
+            fi
+            ;;
+        --session-history)
+            SESSION_HISTORY_ID="${2:-}"
+            if [[ -z "${SESSION_HISTORY_ID}" ]]; then
+                echo "speak: --session-history requires a session PID" >&2; exit 1
+            fi
+            shift 2
+            SESSION_HISTORY_N="${1:-10}"
+            if [[ "${SESSION_HISTORY_N}" =~ ^[0-9]+$ ]]; then
+                shift 2>/dev/null || true
+            else
+                SESSION_HISTORY_N=10
+            fi
             ;;
         --agent-summary)
             AGENT_SUMMARY_PID="${2:-}"
@@ -647,6 +675,58 @@ sock.close()
     else
         python3 "${SCRIPT_DIR}/speak-client" --command "${QUEUE_CMD}"
     fi
+    exit 0
+fi
+
+# --- Handle --caller-history ---
+if [[ -n "${CALLER_HISTORY_NAME:-}" ]]; then
+    if ! daemon_is_running; then
+        echo "speak: daemon not running (start with: speak --daemon)" >&2
+        exit 1
+    fi
+    python3 -c "
+import socket, struct, json, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+msg = json.dumps({'command': 'caller_history', 'caller': '${CALLER_HISTORY_NAME}', 'n': ${CALLER_HISTORY_N:-10}}).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = sock.recv(resp_len)
+    resp = json.loads(data)
+    entries = resp.get('entries', [])
+    json.dump(entries, sys.stdout, indent=2)
+    print()
+sock.close()
+"
+    exit 0
+fi
+
+# --- Handle --session-history ---
+if [[ -n "${SESSION_HISTORY_ID:-}" ]]; then
+    if ! daemon_is_running; then
+        echo "speak: daemon not running (start with: speak --daemon)" >&2
+        exit 1
+    fi
+    python3 -c "
+import socket, struct, json, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+msg = json.dumps({'command': 'session_history', 'session': '${SESSION_HISTORY_ID}', 'n': ${SESSION_HISTORY_N:-10}}).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = sock.recv(resp_len)
+    resp = json.loads(data)
+    entries = resp.get('entries', [])
+    json.dump(entries, sys.stdout, indent=2)
+    print()
+sock.close()
+"
     exit 0
 fi
 
