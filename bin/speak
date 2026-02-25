@@ -76,7 +76,8 @@ Options:
   --daemon          Show daemon status / start it
   --restart         Restart the daemon
   --stop            Stop the daemon
-  --enqueue         Queue text and return immediately (no blocking)
+  --enqueue         Queue text and return immediately (default)
+  --stream          Stream audio via ffplay (blocking, old default)
   --queue           Show playback queue status
   --skip            Skip currently playing queued item
   --clear           Clear pending playback queue
@@ -240,7 +241,7 @@ stop_daemon() {
 LIST_VOICES=false
 LIST_DEVICES=false
 DAEMON_CMD=""
-ENQUEUE=false
+ENQUEUE="${SPEAK_ENQUEUE:-true}"
 QUEUE_CMD=""
 TEXT_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -259,6 +260,7 @@ while [[ $# -gt 0 ]]; do
         --stop)       DAEMON_CMD="stop"; shift ;;
         --caller)     CALLER="$2"; shift 2 ;;
         --enqueue)    ENQUEUE=true; shift ;;
+        --stream)     ENQUEUE=false; shift ;;
         --queue)      QUEUE_CMD="queue_status"; shift ;;
         --skip)       QUEUE_CMD="skip"; shift ;;
         --clear)      QUEUE_CMD="clear"; shift ;;
