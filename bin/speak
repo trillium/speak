@@ -13,6 +13,7 @@ SAVE_FILE=""
 VOICE=""
 CALLER="${SPEAK_CALLER:-}"
 ENQUEUE_BACKEND="${SPEAK_ENQUEUE_BACKEND:-auto}"  # auto, c, perl, python
+DEVICE=""
 FLAGGED_FILE="${SCRIPT_DIR}/../config/flagged.json"
 MUTE_FILE="/tmp/speak-${USER}.muted"
 
@@ -69,7 +70,11 @@ Options:
   --speed FLOAT     Speech speed (default: 1.26)
   --save FILE       Save to WAV file instead of playing
   --voices          List available voices for the selected engine
+  --devices         List audio output devices (with index numbers)
+  --device ID       Audio device for daemon (index or name substring)
+  --set-device ID   Switch audio device on running daemon
   --daemon          Show daemon status / start it
+  --restart         Restart the daemon
   --stop            Stop the daemon
   --enqueue         Queue text and return immediately (no blocking)
   --queue           Show playback queue status
@@ -131,6 +136,12 @@ Kokoro voices (prefix: af_=American female, am_=American male, bf_/bm_=British):
   af_heart, af_sarah, af_bella, af_nova, af_sky, af_nicole, af_alloy, ...
   am_adam, am_michael, am_eric, am_liam, am_onyx, am_puck, am_fenrir, ...
 
+Audio device selection:
+  speak --devices                      List output devices with index numbers
+  speak --device 3 --daemon            Start daemon on device index 3
+  speak --device "Jabra" --daemon      Start daemon matching device name
+  speak --set-device 5                 Switch device on running daemon
+
 Examples:
   speak "Hello world"
   echo "piped text" | speak
@@ -185,10 +196,14 @@ start_daemon() {
     fi
 
     local logfile="${SOCK_PATH}.log"
+    local device_flag=()
+    if [[ -n "${DEVICE}" ]]; then
+        device_flag=(--device "${DEVICE}")
+    fi
     echo "speak: starting daemon... (log: ${logfile})" >&2
     uv run --python 3.14 --with kokoro-onnx --with sounddevice -- \
         python3 "${SCRIPT_DIR}/speak-daemon" \
-            --model "${model}" --voices "${voices}" 2>"${logfile}" &
+            --model "${model}" --voices "${voices}" ${device_flag[@]+"${device_flag[@]}"} 2>"${logfile}" &
     disown
 
     # Wait for socket to appear
@@ -223,6 +238,7 @@ stop_daemon() {
 
 # --- Parse arguments ---
 LIST_VOICES=false
+LIST_DEVICES=false
 DAEMON_CMD=""
 ENQUEUE=false
 QUEUE_CMD=""
@@ -235,7 +251,11 @@ while [[ $# -gt 0 ]]; do
         --speed)      SPEED="$2"; shift 2 ;;
         --save)       SAVE_FILE="$2"; shift 2 ;;
         --voices)     LIST_VOICES=true; shift ;;
+        --devices)    LIST_DEVICES=true; shift ;;
+        --device)     DEVICE="$2"; shift 2 ;;
+        --set-device) SET_DEVICE="$2"; shift 2 ;;
         --daemon)     DAEMON_CMD="status"; shift ;;
+        --restart)    DAEMON_CMD="restart"; shift ;;
         --stop)       DAEMON_CMD="stop"; shift ;;
         --caller)     CALLER="$2"; shift 2 ;;
         --enqueue)    ENQUEUE=true; shift ;;
@@ -528,6 +548,14 @@ if [[ "${DAEMON_CMD}" == "stop" ]]; then
     exit 0
 fi
 
+if [[ "${DAEMON_CMD}" == "restart" ]]; then
+    if daemon_is_running; then
+        stop_daemon
+    fi
+    start_daemon
+    exit 0
+fi
+
 if [[ "${DAEMON_CMD}" == "status" ]]; then
     if daemon_is_running; then
         echo "speak: daemon running (pid $(cat "${SOCK_PATH}.pid"))" >&2
@@ -535,6 +563,57 @@ if [[ "${DAEMON_CMD}" == "status" ]]; then
         echo "speak: daemon not running, starting..." >&2
         start_daemon
     fi
+    exit 0
+fi
+
+# --- Handle --devices (list audio output devices, no daemon needed) ---
+if [[ "${LIST_DEVICES}" == true ]]; then
+    uv run --python 3.14 --with sounddevice -- python3 -c "
+import sounddevice as sd
+devices = sd.query_devices()
+default_out = sd.default.device[1]
+for i, d in enumerate(devices):
+    if d['max_output_channels'] > 0:
+        marker = ' *' if i == default_out else ''
+        print(f\"  {i:>3}  {d['name']}  ({d['max_output_channels']}ch){marker}\")
+print()
+print('  * = default output device')
+"
+    exit 0
+fi
+
+# --- Handle --set-device (switch device on running daemon) ---
+if [[ -n "${SET_DEVICE:-}" ]]; then
+    if ! daemon_is_running; then
+        echo "speak: daemon not running (start with: speak --daemon)" >&2
+        exit 1
+    fi
+    # Try to parse as int, else send as string
+    python3 -c "
+import socket, struct, json, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+device = '${SET_DEVICE}'
+try:
+    device = int(device)
+except ValueError:
+    pass
+msg = json.dumps({'command': 'set_device', 'device': device}).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = sock.recv(resp_len)
+    resp = json.loads(data)
+    if resp.get('ok'):
+        d = resp['device']
+        print(f\"speak: switched to device {d['index']} ({d['name']})\")
+    else:
+        print(f\"speak: error: {resp.get('error', 'unknown')}\", file=sys.stderr)
+        sys.exit(1)
+sock.close()
+"
     exit 0
 fi
 

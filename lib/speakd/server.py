@@ -22,7 +22,7 @@ from .voice_pool import VoicePool
 
 
 class SpeakDaemon:
-    def __init__(self, model_path: str, voices_path: str):
+    def __init__(self, model_path: str, voices_path: str, device=None):
         self.kokoro = Kokoro(model_path, voices_path)
         self.cache = AudioCache(CACHE_DIR, CACHE_TTL_DAYS)
         self.synth = SynthesisEngine(self.kokoro, self.cache)
@@ -40,6 +40,7 @@ class SpeakDaemon:
             bg_task_tracker=self._track_bg_task,
             voice_pool=self.voice_pool,
             subscriber_manager=self.subscriber_manager,
+            device=device,
         )
 
     def _touch_activity(self):
@@ -97,6 +98,52 @@ class SpeakDaemon:
                     else:
                         released = self.voice_pool.release_voice(voice)
                         result = {"ok": True, "released": released}
+                elif command == "list_devices":
+                    import sounddevice as sd
+                    devices = sd.query_devices()
+                    default_out = sd.default.device[1]
+                    output_devices = []
+                    for i, d in enumerate(devices):
+                        if d["max_output_channels"] > 0:
+                            output_devices.append({
+                                "index": i,
+                                "name": d["name"],
+                                "channels": d["max_output_channels"],
+                                "default": i == default_out,
+                            })
+                    result = {"ok": True, "devices": output_devices}
+                elif command == "set_device":
+                    device = request.get("device")
+                    if device is None:
+                        result = {"ok": False, "error": "set_device requires 'device' field (int index or string name)"}
+                    else:
+                        # Validate device before switching
+                        import sounddevice as sd
+                        try:
+                            if isinstance(device, int):
+                                info = sd.query_devices(device)
+                                if info["max_output_channels"] == 0:
+                                    result = {"ok": False, "error": f"device {device} has no output channels"}
+                                else:
+                                    await self.playback_queue.set_device(device)
+                                    result = {"ok": True, "device": {"index": device, "name": info["name"]}}
+                            else:
+                                # String name — resolve to index
+                                devices = sd.query_devices()
+                                needle = str(device).lower()
+                                matched = None
+                                for i, d in enumerate(devices):
+                                    if d["max_output_channels"] > 0 and needle in d["name"].lower():
+                                        matched = i
+                                        break
+                                if matched is None:
+                                    result = {"ok": False, "error": f"no output device matching '{device}'"}
+                                else:
+                                    await self.playback_queue.set_device(matched)
+                                    info = sd.query_devices(matched)
+                                    result = {"ok": True, "device": {"index": matched, "name": info["name"]}}
+                        except Exception as e:
+                            result = {"ok": False, "error": str(e)}
                 elif command == "history":
                     n = request.get("n", 10)
                     result = {"ok": True, "entries": self.playback_queue.get_history(n)}
@@ -262,14 +309,36 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--voices", required=True)
+    parser.add_argument("--device", default=None, help="Audio output device (index or name substring)")
     args = parser.parse_args()
+
+    # Parse device: try int first, else keep as string for name matching
+    device = args.device
+    if device is not None:
+        try:
+            device = int(device)
+        except ValueError:
+            # String name — resolve to index at startup
+            import sounddevice as sd
+            devices = sd.query_devices()
+            needle = device.lower()
+            matched = None
+            for i, d in enumerate(devices):
+                if d["max_output_channels"] > 0 and needle in d["name"].lower():
+                    matched = i
+                    break
+            if matched is None:
+                print(f"speak-daemon: no output device matching '{device}'", file=sys.stderr)
+                sys.exit(1)
+            print(f"speak-daemon: resolved device '{device}' -> index {matched} ({devices[matched]['name']})", file=sys.stderr)
+            device = matched
 
     # Handle signals for clean shutdown
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: cleanup_and_exit())
 
     print("speak-daemon: loading model...", file=sys.stderr)
-    daemon = SpeakDaemon(args.model, args.voices)
+    daemon = SpeakDaemon(args.model, args.voices, device=device)
     s = daemon.cache.stats()
     print(
         f"speak-daemon: model loaded, ready. cache={CACHE_DIR}\n"

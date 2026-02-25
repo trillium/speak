@@ -18,13 +18,19 @@ WRITE_CHUNK_BYTES = int(SAMPLE_RATE * 2 * 0.25)  # 0.25s of audio per write
 class AudioOutputStream:
     """Manages a sounddevice RawOutputStream for continuous PCM streaming."""
 
-    def __init__(self, subscriber_manager=None):
+    def __init__(self, subscriber_manager=None, device=None):
         self._stream: sd.RawOutputStream | None = None
         self._subscriber_manager = subscriber_manager
+        self._device = device  # int index, str name substring, or None for default
 
     @property
     def is_alive(self) -> bool:
         return self._stream is not None and self._stream.active
+
+    async def set_device(self, device) -> None:
+        """Switch to a different audio device. Kills current stream so next write reopens."""
+        self._device = device
+        await self.kill()
 
     async def kill(self, force: bool = False) -> None:
         """Shut down the audio stream.
@@ -57,12 +63,15 @@ class AudioOutputStream:
 
         loop = asyncio.get_event_loop()
 
+        device = self._device
+
         def _open():
             s = sd.RawOutputStream(
                 samplerate=SAMPLE_RATE,
                 channels=1,
                 dtype="int16",
                 latency="low",
+                device=device,
             )
             s.start()
             return s

@@ -36,6 +36,7 @@ class PlaybackQueue:
         bg_task_tracker: Callable[[asyncio.Task], None],
         voice_pool: VoicePool | None = None,
         subscriber_manager=None,
+        device=None,
     ):
         self.synth = synth
         self._on_activity = on_activity
@@ -44,7 +45,7 @@ class PlaybackQueue:
         self._subscriber_manager = subscriber_manager
         self._queue: asyncio.Queue = asyncio.Queue()
         self._current: dict | None = None
-        self._ffplay = AudioOutputStream(subscriber_manager=subscriber_manager)
+        self._ffplay = AudioOutputStream(subscriber_manager=subscriber_manager, device=device)
         self._worker_task: asyncio.Task | None = None
         self._id_counter = 0
         self._skip_flag = False
@@ -67,6 +68,10 @@ class PlaybackQueue:
 
     def get_history_by_caller(self, caller: str, n: int = 10) -> list[str]:
         return self._history.get_by_caller(caller, n)
+
+    async def set_device(self, device):
+        """Switch audio output device at runtime."""
+        await self._ffplay.set_device(device)
 
     def start(self):
         self._worker_task = asyncio.create_task(self._worker())
