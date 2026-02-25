@@ -4,9 +4,9 @@
 # Edits take effect on the next synthesis — no daemon restart needed.
 
 gaps:
-  ".": 300   # period
-  "?": 300   # question mark
-  "!": 300   # exclamation point
+  ".": 270   # period
+  "?": 270   # question mark
+  "!": 270   # exclamation point
   ":": 220   # colon
   ";": 220   # semicolon
   "-": 220   # dash
