@@ -60,7 +60,7 @@ case "${EVENT}" in
         MSG=$(echo "$INPUT" | jq -r '.last_assistant_message // empty')
         AGENT_TYPE=$(echo "$INPUT" | jq -r '.agent_type // "agent"')
         if [[ -n "${MSG}" ]]; then
-            printf '%s' "${AGENT_TYPE} agent finished. ${MSG}" | _summarize_and_speak
+            printf '%s' "claude background agent here. ${MSG}" | _summarize_and_speak
         fi
         ;;
 esac
