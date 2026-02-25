@@ -166,6 +166,14 @@ class PlaybackQueue:
             request = await self._queue.get()
             self._current = request
             self._skip_flag = False
+            # Record in history early so queries see it before playback finishes
+            text_for_history = request.get("text", "")
+            if text_for_history:
+                self.record_history(
+                    text_for_history,
+                    caller=request.get("caller", ""),
+                    session=request.get("session", ""),
+                )
             try:
                 caller = request.get("caller")
                 # Spacing between items:
@@ -305,14 +313,6 @@ class PlaybackQueue:
                 self._last_caller = caller
                 self._items_played += 1
                 self.total_completed += 1
-                # Record in history
-                text = request.get("text", "")
-                if text:
-                    self.record_history(
-                        text,
-                        caller=request.get("caller", ""),
-                        session=request.get("session", ""),
-                    )
             except Exception as e:
                 print(f"speak-daemon: queue playback error: {e}", file=sys.stderr)
             finally:
