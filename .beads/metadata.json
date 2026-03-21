@@ -1,6 +1,9 @@
 {
   "database": "dolt",
-  "jsonl_export": "issues.jsonl",
   "backend": "dolt",
-  "dolt_database": "beads_speak"
+  "dolt_mode": "server",
+  "dolt_server_host": "100.111.197.110",
+  "dolt_server_port": 3307,
+  "dolt_database": "speak",
+  "project_id": "speak"
 }
