@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Apply phrase rewrites and pronunciation fixes for TTS output.
 
-Reads text from stdin, applies rewrites from config/rewrites.json, writes to stdout.
-This is a pure text transformation — no LLM calls. Use bin/summarize for that.
+Reads text from stdin, applies all transformations, writes to stdout.
+Delegates to the shared tts-pronunciation-dictionary for the full pipeline,
+then applies any local overrides from config/rewrites.json on top.
 """
 
 import json
@@ -12,80 +13,33 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "..", "config", "rewrites.json")
+DICTIONARY_DIR = os.path.expanduser("~/code/tts-pronunciation-dictionary")
 
-# External TTS pronunciation dictionary (base layer, overridden by local entries)
-DICTIONARY_PATH = os.path.expanduser("~/code/tts-pronunciation-dictionary/flat.json")
+# Add shared dictionary to path
+sys.path.insert(0, DICTIONARY_DIR)
 
 
-def load_config():
-    # Load external dictionary as base pronunciation layer
-    pronunciation = {}
-    try:
-        with open(DICTIONARY_PATH) as f:
-            pronunciation = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-
-    # Load local config (overrides external dictionary)
+def _load_local_overrides() -> dict:
+    """Load speak-specific overrides from config/rewrites.json."""
     try:
         with open(CONFIG_PATH) as f:
-            config = json.load(f)
+            return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        config = {}
-
-    # Merge: local pronunciations override external dictionary
-    pronunciation.update(config.get("pronunciation", {}))
-    config["pronunciation"] = pronunciation
-    config.setdefault("phrase_rewrites", {})
-    return config
+        return {}
 
 
-def split_compound_words(text):
-    """Split snake_case and kebab-case words into separate words.
-
-    Runs before pronunciation rewrites so individual words get handled
-    by their own rules (e.g. api_key -> api key -> eh pee eye key).
-    """
-    # snake_case: replace underscores between word chars with spaces
-    text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
-    # kebab-case: replace hyphens between lowercase/digit chars with spaces
-    # (avoids splitting real hyphens like "well-known" by requiring lowercase on both sides)
-    text = re.sub(r'(?<=[a-z0-9])-(?=[a-z0-9])', ' ', text)
-    return text
-
-
-def apply_phrase_rewrites(text, rewrites):
-    for phrase, replacement in rewrites.items():
-        pattern = re.escape(phrase)
-        text = re.sub(pattern, replacement, text)
-    # Clean up artifacts from removed phrases
-    text = re.sub(r"  +", " ", text)
-    text = re.sub(r"^\s*[.,!?]\s*", "", text)
-    text = re.sub(r"\.\s*[.,!?]", ".", text)
-    return text.strip()
-
-
-def _spell_out(match):
-    """Spell out an all-caps word letter-by-letter, e.g. PID -> P I D."""
-    return " ".join(match.group(0))
-
-
-def apply_pronunciation(text, pronunciation):
+def _apply_local_pronunciation(text: str, pronunciation: dict) -> str:
+    """Apply local pronunciation overrides (same logic as shared tool)."""
     for word, replacement in pronunciation.items():
         if word == word.upper() and len(word) > 1:
-            # Acronym: exact case match
             text = re.sub(r"\b" + re.escape(word) + r"\b", replacement, text)
         else:
-            # Regular word: case-insensitive
             text = re.sub(
                 r"\b" + re.escape(word) + r"\b",
                 replacement,
                 text,
                 flags=re.IGNORECASE,
             )
-    # Catch-all: spell out any remaining all-caps words (2+ letters)
-    # that weren't already handled by explicit pronunciation entries
-    text = re.sub(r"\b[A-Z]{2,}\b", _spell_out, text)
     return text
 
 
@@ -94,17 +48,36 @@ def main():
     if not text:
         return
 
-    config = load_config()
-    # Strip machine-readable noise: long hashes, UUIDs, file paths
-    text = re.sub(r'\b[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\b', '', text)  # UUIDs
-    text = re.sub(r'\b[0-9a-f]{12,}\b', '', text)                 # long hex hashes/SHAs
-    text = re.sub(r'(/[\w./-]{20,})', 'the file', text)           # long file paths
-    text = re.sub(r'  +', ' ', text)
-    text = apply_phrase_rewrites(text, config.get("phrase_rewrites", {}))
-    text = apply_pronunciation(text, config.get("pronunciation", {}))
-    text = split_compound_words(text)
-    # Second pass: catch words that were hidden inside snake_case/kebab-case
-    text = apply_pronunciation(text, config.get("pronunciation", {}))
+    # Primary: shared dictionary pipeline (camelCase, acronyms, verb stress,
+    # compound splitting, noise stripping, filler removal, colon pauses)
+    try:
+        from preprocess import preprocess
+        text = preprocess(text)
+    except ImportError:
+        # Fallback: shared dictionary not available, do basic cleanup
+        print(
+            "speak-summarize: WARNING: tts-pronunciation-dictionary not found, "
+            "using basic mode",
+            file=sys.stderr,
+        )
+        text = re.sub(r'\b[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\b', '', text)
+        text = re.sub(r'\b[0-9a-f]{12,}\b', '', text)
+        text = re.sub(r'(/[\w./-]{20,})', 'the file', text)
+        text = re.sub(r'  +', ' ', text)
+
+    # Secondary: apply any speak-local overrides on top
+    local = _load_local_overrides()
+    local_pron = local.get("pronunciation", {})
+    if local_pron:
+        text = _apply_local_pronunciation(text, local_pron)
+
+    # Local phrase rewrites (already applied by shared tool if in flat.json,
+    # but speak may have its own additions)
+    local_phrases = local.get("phrase_rewrites", {})
+    if local_phrases:
+        for phrase, replacement in local_phrases.items():
+            text = re.sub(re.escape(phrase), replacement, text)
+        text = re.sub(r"  +", " ", text).strip()
 
     if text:
         print(text)
