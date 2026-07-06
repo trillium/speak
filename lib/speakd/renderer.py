@@ -336,109 +336,83 @@ async def render_speech(
             file=sys.stderr,
         )
 
-    # Split text into sys-sentinel and text segments
+    # Split text into sys-sentinel and text segments.
     segments = _split_sys_segments(text)
     clause_offset = 0  # global clause index across all text segments
 
-    if prefetch is not None:
-        first_chunks, remaining_clauses = prefetch
-        # The prefetch covers the first clause of the first text segment.
-        # We play the prefetched audio first, then iterate segments normally
-        # (skipping the first clause of the first text segment since it's already done).
-        prefetch_consumed = False
+    # A single segment loop handles both the prefetch and no-prefetch cases.
+    # When prefetch is available, the first *text* segment consumes the
+    # prefetched first-clause audio (its tail is remaining_clauses); every
+    # other segment and clause synthesizes normally. `first_played` tracks
+    # whether any audible clause has played yet, driving is_first lead padding.
+    #
+    # Prefetch is only supplied when resume_from_clause == 0 (see playback.py),
+    # so the prefetched clause is always at/after the resume point and the
+    # `ci < resume_from_clause` skips never fire on the prefetch tail.
+    first_chunks, remaining_clauses = prefetch if prefetch is not None else ([], [])
+    have_prefetch = prefetch is not None and bool(first_chunks)
+    prefetch_consumed = False
+    first_played = True
 
-        for seg_kind, seg_content in segments:
-            if skip_flag_fn():
-                break
+    for seg_kind, seg_content in segments:
+        if skip_flag_fn():
+            break
 
-            if seg_kind == 'sys':
-                # Play sys clip (or fall back to synthesizing in caller voice)
-                played = await _play_sys_clip(seg_content, audio_stream, skip_flag_fn, gain)
-                if not played:
-                    # Fallback: synthesize slug text in caller voice
-                    readable = seg_content.replace('_', ' ')
-                    if not await _synthesize_and_play_clause(readable, is_first=(clause_offset == 0 and not prefetch_consumed)):
-                        break
-                    clause_offset += 1
-                continue
+        if seg_kind == 'sys':
+            # Play the pre-built sys clip, or fall back to synthesizing the slug.
+            played = await _play_sys_clip(seg_content, audio_stream, skip_flag_fn, gain)
+            if not played:
+                readable = seg_content.replace('_', ' ')
+                if not await _synthesize_and_play_clause(readable, is_first=first_played):
+                    break
+                first_played = False
+                clause_offset += 1
+            continue
 
-            # Text segment
-            seg_clauses = split_clauses(seg_content)
+        # Text segment — split exactly once.
+        seg_clauses = split_clauses(seg_content)
 
-            if not prefetch_consumed and first_chunks:
-                # Play the prefetched first clause
-                if resume_from_clause <= clause_offset:
-                    all_clauses_for_split = split_clauses(seg_content)
-                    first_clause_text = all_clauses_for_split[0] if all_clauses_for_split else ""
-                    split_char = _get_split_char(first_clause_text)
+        if have_prefetch and not prefetch_consumed:
+            # First text segment: its first clause was prefetched during the
+            # caller tone. Play that audio, then synthesize the tail.
+            prefetch_consumed = True
+            first_clause_text = seg_clauses[0] if seg_clauses else ""
+            split_char = _get_split_char(first_clause_text)
+            if on_clause_start:
+                on_clause_start(clause_offset, first_clause_text)
+            full_audio = np.concatenate([a.squeeze() for a, sr in first_chunks])
+            trimmed = trim_clause_audio(full_audio, split_char, None, is_first=True)
+            await _play_audio(trimmed)
+            prev_split_char = split_char
+            first_played = False
 
-                    if on_clause_start:
-                        on_clause_start(clause_offset, first_clause_text)
-
-                    full_audio = np.concatenate([a.squeeze() for a, sr in first_chunks])
-                    trimmed = trim_clause_audio(full_audio, split_char, None, is_first=True)
-                    await _play_audio(trimmed)
-                    prev_split_char = split_char
-                prefetch_consumed = True
-
-                # remaining_clauses from prefetch are already the tail of this segment
-                for i, clause in enumerate(remaining_clauses):
-                    ci = clause_offset + 1 + i
-                    if ci < resume_from_clause:
-                        continue
-                    if skip_flag_fn():
-                        break
-                    if on_clause_start:
-                        on_clause_start(ci, clause)
-                    if not await _synthesize_and_play_clause(clause, is_first=False):
-                        break
-                clause_offset += len(seg_clauses)
-                continue
-
-            # Normal text segment (no prefetch for this one)
-            for i, clause in enumerate(seg_clauses):
-                ci = clause_offset + i
+            for i, clause in enumerate(remaining_clauses):
+                ci = clause_offset + 1 + i
                 if ci < resume_from_clause:
                     continue
                 if skip_flag_fn():
                     break
                 if on_clause_start:
                     on_clause_start(ci, clause)
-                if not await _synthesize_and_play_clause(clause, is_first=(ci == 0)):
-                    break
-            clause_offset += len(seg_clauses)
-
-    else:
-        # No prefetch — iterate segments directly
-        first_played = True
-        for seg_kind, seg_content in segments:
-            if skip_flag_fn():
-                break
-
-            if seg_kind == 'sys':
-                played = await _play_sys_clip(seg_content, audio_stream, skip_flag_fn, gain)
-                if not played:
-                    readable = seg_content.replace('_', ' ')
-                    if not await _synthesize_and_play_clause(readable, is_first=first_played):
-                        break
-                    first_played = False
-                    clause_offset += 1
-                continue
-
-            # Text segment
-            seg_clauses = split_clauses(seg_content)
-            for i, clause in enumerate(seg_clauses):
-                ci = clause_offset + i
-                if ci < resume_from_clause:
-                    continue
-                if skip_flag_fn():
-                    break
-                if on_clause_start:
-                    on_clause_start(ci, clause)
-                if not await _synthesize_and_play_clause(clause, is_first=first_played):
+                if not await _synthesize_and_play_clause(clause, is_first=False):
                     break
                 first_played = False
             clause_offset += len(seg_clauses)
+            continue
+
+        # Normal text segment (no prefetch, or prefetch already consumed).
+        for i, clause in enumerate(seg_clauses):
+            ci = clause_offset + i
+            if ci < resume_from_clause:
+                continue
+            if skip_flag_fn():
+                break
+            if on_clause_start:
+                on_clause_start(ci, clause)
+            if not await _synthesize_and_play_clause(clause, is_first=first_played):
+                break
+            first_played = False
+        clause_offset += len(seg_clauses)
 
     total_ms = (time.monotonic() - item_t0) * 1000
     proc_alive = audio_stream.is_alive
