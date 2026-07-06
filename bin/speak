@@ -185,6 +185,55 @@ _require_ffplay() {
     fi
 }
 
+# --- Failure logging ---
+# Append a JSON line recording a dropped/failed speech attempt so silence is
+# observable after the fact. Best-effort: never breaks the caller (all failures
+# swallowed, always returns 0). Rotates at 5 MB like the daemon log.
+#   {ts, stage, caller, exit_code, text_head (first 80 chars)}
+_log_failure() {
+    local stage="$1"
+    local exit_code="${2:-}"
+    local text="${3:-}"
+    local failures_dir="${HOME}/.local/share/speak"
+    local failures_file="${failures_dir}/failures.jsonl"
+
+    mkdir -p "${failures_dir}" 2>/dev/null || return 0
+
+    # Rotate if over 5 MB
+    if [[ -f "${failures_file}" ]] && \
+       [[ $(stat -f%z "${failures_file}" 2>/dev/null || echo 0) -gt 5242880 ]]; then
+        mv "${failures_file}" "${failures_file}.1" 2>/dev/null || true
+    fi
+
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # Normalize exit_code to a JSON number; -1 if unknown/non-numeric
+    [[ "${exit_code}" =~ ^-?[0-9]+$ ]] || exit_code=-1
+    # First 80 chars, newlines flattened so each record stays one line
+    local text_head="${text:0:80}"
+    text_head="${text_head//$'\n'/ }"
+    local caller="${CALLER:-}"
+
+    if command -v jq >/dev/null 2>&1; then
+        jq -cn \
+            --arg ts "${ts}" \
+            --arg stage "${stage}" \
+            --arg caller "${caller}" \
+            --argjson exit_code "${exit_code}" \
+            --arg text_head "${text_head}" \
+            '{ts:$ts, stage:$stage, caller:$caller, exit_code:$exit_code, text_head:$text_head}' \
+            >> "${failures_file}" 2>/dev/null || true
+    else
+        # Minimal-escaping fallback: escape backslash then double-quote
+        local esc_head="${text_head//\\/\\\\}"; esc_head="${esc_head//\"/\\\"}"
+        local esc_caller="${caller//\\/\\\\}"; esc_caller="${esc_caller//\"/\\\"}"
+        printf '{"ts":"%s","stage":"%s","caller":"%s","exit_code":%s,"text_head":"%s"}\n' \
+            "${ts}" "${stage}" "${esc_caller}" "${exit_code}" "${esc_head}" \
+            >> "${failures_file}" 2>/dev/null || true
+    fi
+    return 0
+}
+
 # --- Daemon management helpers ---
 daemon_is_running() {
     [[ -S "${SOCK_PATH}" ]] && [[ -f "${SOCK_PATH}.pid" ]] && kill -0 "$(cat "${SOCK_PATH}.pid")" 2>/dev/null
@@ -200,6 +249,7 @@ start_daemon() {
 
     if [[ ! -f "${model}" || ! -f "${voices}" ]]; then
         echo "speak: kokoro model files not found in ${KOKORO_DIR}" >&2
+        _log_failure "start_daemon:model_missing" 1 "${TEXT:-}"
         return 1
     fi
 
@@ -294,6 +344,7 @@ PYEOF
 
     if [[ ! -S "${SOCK_PATH}" ]]; then
         echo "speak: daemon failed to start" >&2
+        _log_failure "start_daemon:socket_timeout" 1 "${TEXT:-}"
         return 1
     fi
     echo "speak: daemon ready." >&2
@@ -1068,14 +1119,21 @@ speak_kokoro() {
             fi
         fi
 
+        local _ec=0
         case "${backend}" in
             c)
                 local caller_flag=()
                 if [[ -n "${CALLER}" ]]; then
                     caller_flag=(-c "${CALLER}")
                 fi
+                # `|| _ec=$?` keeps set -e from aborting AND captures the real
+                # pipeline exit code (pipefail => backend's code) for the log.
                 printf '%s' "${TEXT}" | "${SCRIPT_DIR}/speak-enqueue" \
-                    -v "${VOICE}" -s "${SPEED}" -S "${SESSION}" "${caller_flag[@]}"
+                    -v "${VOICE}" -s "${SPEED}" -S "${SESSION}" "${caller_flag[@]}" || _ec=$?
+                if [[ ${_ec} -ne 0 ]]; then
+                    _log_failure "enqueue_c" "${_ec}" "${TEXT}"
+                    exit "${_ec}"
+                fi
                 ;;
             python)
                 local caller_flag=()
@@ -1084,7 +1142,11 @@ speak_kokoro() {
                 fi
                 printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
                     --enqueue --voice "${VOICE}" --speed "${SPEED}" \
-                    --session "${SESSION}" "${caller_flag[@]}"
+                    --session "${SESSION}" "${caller_flag[@]}" || _ec=$?
+                if [[ ${_ec} -ne 0 ]]; then
+                    _log_failure "enqueue_python" "${_ec}" "${TEXT}"
+                    exit "${_ec}"
+                fi
                 ;;
             *)
                 echo "speak: unknown enqueue backend '${backend}' (use c or python)" >&2
