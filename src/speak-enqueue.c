@@ -18,7 +18,11 @@
 #include <errno.h>
 
 #define MAX_TEXT 65536
-#define MAX_JSON (MAX_TEXT + 512)
+/* JSON envelope must hold fully-escaped text (every byte can double) plus
+ * the field scaffolding, so size it off the escaped worst case, not the raw
+ * text length. Undersizing here let snprintf truncate while returning the
+ * would-be length, which write() then trusted -> out-of-bounds send. */
+#define MAX_JSON (MAX_TEXT * 2 + 1024)
 
 static char *get_sock_path(void) {
     static char buf[256];
@@ -102,6 +106,15 @@ int main(int argc, char *argv[]) {
         json_len = snprintf(json, sizeof(json),
             "{\"enqueue\":true,\"text\":\"%s\",\"voice\":\"%s\",\"speed\":%s,\"session\":\"%s\"}",
             escaped, voice, speed, session);
+
+    /* snprintf returns the length it WOULD have written; if that meets or
+     * exceeds the buffer the JSON was truncated, so refuse rather than
+     * write(json_len) past the buffer. */
+    if (json_len < 0 || json_len >= (int)sizeof(json)) {
+        fprintf(stderr, "speak-enqueue: message too large (%d bytes, max %d)\n",
+                json_len, (int)sizeof(json) - 1);
+        return 1;
+    }
 
     /* connect to daemon */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
