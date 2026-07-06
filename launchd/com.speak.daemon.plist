@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.speak.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/uv</string>
+        <string>run</string>
+        <string>--python</string>
+        <string>3.14</string>
+        <string>--with</string>
+        <string>kokoro-onnx</string>
+        <string>--with</string>
+        <string>sounddevice</string>
+        <string>--with</string>
+        <string>pyyaml</string>
+        <string>--</string>
+        <string>python3</string>
+        <string>/Users/trilliumsmith/code/speak/bin/speak-daemon</string>
+        <string>--model</string>
+        <string>/Users/trilliumsmith/.local/share/speak/kokoro/kokoro-v1.0.onnx</string>
+        <string>--voices</string>
+        <string>/Users/trilliumsmith/.local/share/speak/kokoro/voices-v1.0.bin</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/trilliumsmith/code/speak</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SPEAK_SUPERVISED</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>/Users/trilliumsmith</string>
+        <!-- USER is required: lib/speakd/config.py derives the socket path from
+             os.environ['USER']; launchd gui agents do not set it by default. -->
+        <key>USER</key>
+        <string>trilliumsmith</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Interactive + the gui/501 domain lets a launchd agent reach the audio
+         output device (a background/standard agent cannot). -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/trilliumsmith/.local/share/speak/daemon.log</string>
+    <key>StandardOutPath</key>
+    <string>/Users/trilliumsmith/.local/share/speak/daemon.log</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

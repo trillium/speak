@@ -289,16 +289,23 @@ class SpeakDaemon:
                     pass
 
     async def idle_watchdog(self):
-        """Shut down if idle for IDLE_TIMEOUT seconds. Evict expired cache periodically."""
+        """Evict expired cache periodically. Idle-exit only when unsupervised.
+
+        Under launchd KeepAlive (SPEAK_SUPERVISED=1) the daemon must never
+        idle-exit: launchd would immediately respawn it, churning the ~10-15s
+        model load on every idle window. Cache eviction still runs regardless.
+        """
+        supervised = os.environ.get("SPEAK_SUPERVISED") == "1"
         evict_interval = 3600  # check once per hour
         last_evict = time.monotonic()
         while True:
             await asyncio.sleep(30)
-            idle_for = time.monotonic() - self.last_activity
-            non_subscriber_conns = self.active_connections - self.subscriber_manager.count
-            if non_subscriber_conns <= 0 and idle_for >= IDLE_TIMEOUT and not self.playback_queue.is_active:
-                print(f"speak-daemon: idle for {IDLE_TIMEOUT}s, shutting down", file=sys.stderr)
-                cleanup_and_exit()
+            if not supervised:
+                idle_for = time.monotonic() - self.last_activity
+                non_subscriber_conns = self.active_connections - self.subscriber_manager.count
+                if non_subscriber_conns <= 0 and idle_for >= IDLE_TIMEOUT and not self.playback_queue.is_active:
+                    print(f"speak-daemon: idle for {IDLE_TIMEOUT}s, shutting down", file=sys.stderr)
+                    cleanup_and_exit()
             if time.monotonic() - last_evict > evict_interval:
                 removed = self.cache.evict_expired()
                 if removed:

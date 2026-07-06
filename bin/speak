@@ -17,6 +17,12 @@ DEVICE=""
 FLAGGED_FILE="${SCRIPT_DIR}/../config/flagged.json"
 MUTE_FILE="/tmp/speak-${USER}.muted"
 
+# launchd supervision (replaces the old bash watchdog subshell)
+LAUNCHD_LABEL="com.speak.daemon"
+LAUNCHD_PLIST_SRC="${SCRIPT_DIR}/../launchd/${LAUNCHD_LABEL}.plist"
+LAUNCHD_PLIST_DST="${HOME}/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+LAUNCHD_DOMAIN="gui/$(id -u)"
+
 # Auto-detect caller from git repo name or cwd basename
 _auto_detect_caller() {
     # Explicit --caller or SPEAK_CALLER takes priority
@@ -239,6 +245,20 @@ daemon_is_running() {
     [[ -S "${SOCK_PATH}" ]] && [[ -f "${SOCK_PATH}.pid" ]] && kill -0 "$(cat "${SOCK_PATH}.pid")" 2>/dev/null
 }
 
+launchd_service_loaded() {
+    launchctl print "${LAUNCHD_DOMAIN}/${LAUNCHD_LABEL}" >/dev/null 2>&1
+}
+
+# Kill any legacy pre-launchd watchdog subshell + daemon (migration path).
+_kill_legacy_watchdog() {
+    if [[ -f "${SOCK_PATH}.watchdog.pid" ]]; then
+        local wpid
+        wpid="$(cat "${SOCK_PATH}.watchdog.pid" 2>/dev/null)"
+        [[ -n "${wpid}" ]] && kill "${wpid}" 2>/dev/null || true
+        rm -f "${SOCK_PATH}.watchdog.pid"
+    fi
+}
+
 start_daemon() {
     if daemon_is_running; then
         return 0
@@ -253,97 +273,50 @@ start_daemon() {
         return 1
     fi
 
-    local logfile="${SOCK_PATH}.log"
-    local persistent_log="${HOME}/.local/share/speak/daemon.log"
-    local device_flag=()
+    # Any legacy bash-watchdog daemon must go before launchd owns supervision.
+    _kill_legacy_watchdog
+
+    mkdir -p "${HOME}/.local/share/speak" "${HOME}/Library/LaunchAgents"
+
+    # Persistent device selection now lives in the plist args (Standard*Path +
+    # launchd own the log; rotation is manual/newsyslog territory).
     if [[ -n "${DEVICE}" ]]; then
-        device_flag=(--device "${DEVICE}")
+        echo "speak: note — persistent device selection now lives in the launchd plist." >&2
+        echo "       Add --device args to ${LAUNCHD_PLIST_SRC} and reinstall, or use --set-device for a runtime switch." >&2
     fi
 
-    # Rotate persistent log if over 10 MB
-    mkdir -p "${HOME}/.local/share/speak"
-    if [[ -f "${persistent_log}" ]] && [[ $(stat -f%z "${persistent_log}" 2>/dev/null || echo 0) -gt 10485760 ]]; then
-        mv "${persistent_log}" "${persistent_log}.1"
-    fi
-
-    echo "speak: starting daemon... (log: ${logfile}, persistent: ${persistent_log})" >&2
-
-    # Watchdog: restarts daemon on crash, stops on clean exit (exit 0 = intentional stop)
-    (
-        while true; do
-            echo "=== daemon start $(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" >> "${persistent_log}"
-            uv run --python 3.14 --with kokoro-onnx --with sounddevice --with pyyaml -- \
-                python3 "${SCRIPT_DIR}/speak-daemon" \
-                    --model "${model}" --voices "${voices}" ${device_flag[@]+"${device_flag[@]}"} \
-                    2> >(tee -a "${persistent_log}" > "${logfile}")
-            exit_code=$?
-            if [[ ${exit_code} -eq 0 ]]; then
-                echo "=== daemon stopped cleanly $(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" >> "${persistent_log}"
-                break
-            else
-                echo "=== daemon CRASHED exit=${exit_code} $(date -u '+%Y-%m-%dT%H:%M:%SZ') — restarting in 3s ===" >> "${persistent_log}"
-                # Write crash report
-                local crash_dir="${HOME}/.local/share/speak/crashes"
-                mkdir -p "${crash_dir}"
-                local crash_ts
-                crash_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-                local crash_file="${crash_dir}/crash-${crash_ts//[: ]/-}.json"
-                local state_file="/tmp/speak-${USER}.state.json"
-                local events_file="/tmp/speak-${USER}.events.jsonl"
-
-                # Capture last state and last 10 events into crash report
-                python3 - <<PYEOF
-import json, os, sys, time
-
-crash_ts = "${crash_ts}"
-exit_code = ${exit_code}
-state_file = "${state_file}"
-events_file = "${events_file}"
-crash_file = "${crash_file}"
-
-report = {
-    "crashed_at": crash_ts,
-    "exit_code": exit_code,
-    "exit_signal": "SIGSEGV" if exit_code == 139 else ("SIGABRT" if exit_code == 134 else None),
-    "last_state": None,
-    "last_events": [],
-}
-
-try:
-    with open(state_file) as f:
-        report["last_state"] = json.load(f)
-except Exception as e:
-    report["last_state_error"] = str(e)
-
-try:
-    with open(events_file) as f:
-        lines = f.readlines()
-    report["last_events"] = [json.loads(l) for l in lines[-10:] if l.strip()]
-except Exception as e:
-    report["last_events_error"] = str(e)
-
-with open(crash_file, "w") as f:
-    json.dump(report, f, indent=2)
-
-print(f"speak-watchdog: crash report written to {crash_file}", file=sys.stderr)
-PYEOF
-                sleep 3
+    if launchd_service_loaded; then
+        # Already bootstrapped — (re)start the existing service.
+        launchctl kickstart "${LAUNCHD_DOMAIN}/${LAUNCHD_LABEL}" >/dev/null 2>&1 || true
+    else
+        # Install the tracked plist and bootstrap it into the gui domain.
+        cp "${LAUNCHD_PLIST_SRC}" "${LAUNCHD_PLIST_DST}"
+        # bootstrap can race a just-departed instance (I/O error 5) — retry.
+        local btries=0
+        until launchctl bootstrap "${LAUNCHD_DOMAIN}" "${LAUNCHD_PLIST_DST}" 2>/dev/null; do
+            # Maybe it became loaded via the race — accept that and move on.
+            launchd_service_loaded && break
+            btries=$((btries + 1))
+            if [[ ${btries} -ge 12 ]]; then
+                echo "speak: launchctl bootstrap failed after ${btries} tries" >&2
+                _log_failure "start_daemon:bootstrap_failed" 1 "${TEXT:-}"
+                return 1
             fi
+            sleep 0.5
         done
-    ) &
-    local watchdog_pid=$!
-    disown
-    echo "${watchdog_pid}" > "${SOCK_PATH}.watchdog.pid"
+    fi
 
-    # Wait for socket to appear
+    echo "speak: starting daemon via launchd (log: ${HOME}/.local/share/speak/daemon.log)..." >&2
+
+    # Wait for the socket. Model load is ~10-15s, so allow up to ~30s.
     local tries=0
-    while [[ ! -S "${SOCK_PATH}" ]] && [[ $tries -lt 30 ]]; do
+    while [[ ! -S "${SOCK_PATH}" ]] && [[ $tries -lt 60 ]]; do
         sleep 0.5
         tries=$((tries + 1))
     done
 
     if [[ ! -S "${SOCK_PATH}" ]]; then
-        echo "speak: daemon failed to start" >&2
+        echo "speak: daemon failed to start (socket did not appear)" >&2
         _log_failure "start_daemon:socket_timeout" 1 "${TEXT:-}"
         return 1
     fi
@@ -351,25 +324,66 @@ PYEOF
 }
 
 stop_daemon() {
-    # Kill watchdog first so it can't restart the daemon after we kill it
-    if [[ -f "${SOCK_PATH}.watchdog.pid" ]]; then
-        local wpid
-        wpid="$(cat "${SOCK_PATH}.watchdog.pid")"
-        kill "${wpid}" 2>/dev/null
-        rm -f "${SOCK_PATH}.watchdog.pid"
+    # Migration: kill any legacy watchdog + daemon from the pre-launchd era.
+    _kill_legacy_watchdog
+
+    if launchd_service_loaded; then
+        launchctl bootout "${LAUNCHD_DOMAIN}/${LAUNCHD_LABEL}" 2>/dev/null || true
+        # Wait for the service to actually depart so KeepAlive can't race us.
+        local gtries=0
+        while launchd_service_loaded && [[ ${gtries} -lt 40 ]]; do
+            sleep 0.25
+            gtries=$((gtries + 1))
+        done
+        echo "speak: daemon stopped (launchd bootout)" >&2
+    else
+        echo "speak: launchd service not loaded" >&2
     fi
+
+    # Kill any lingering/orphaned daemon pid and clean stale socket + pid files.
     if [[ -f "${SOCK_PATH}.pid" ]]; then
         local pid
-        pid="$(cat "${SOCK_PATH}.pid")"
-        if kill -0 "${pid}" 2>/dev/null; then
-            kill "${pid}"
-            echo "speak: daemon stopped (pid ${pid})" >&2
-        else
-            echo "speak: daemon not running (stale pid file)" >&2
+        pid="$(cat "${SOCK_PATH}.pid" 2>/dev/null)"
+        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null || true
         fi
-        rm -f "${SOCK_PATH}" "${SOCK_PATH}.pid"
+    fi
+    rm -f "${SOCK_PATH}" "${SOCK_PATH}.pid"
+}
+
+restart_daemon() {
+    if ! launchd_service_loaded; then
+        # Not bootstrapped yet — fall back to a clean stop + start.
+        stop_daemon
+        start_daemon
+        return
+    fi
+
+    local old_pid=""
+    [[ -f "${SOCK_PATH}.pid" ]] && old_pid="$(cat "${SOCK_PATH}.pid" 2>/dev/null)"
+    echo "speak: restarting daemon (launchd kickstart -k)..." >&2
+    launchctl kickstart -k "${LAUNCHD_DOMAIN}/${LAUNCHD_LABEL}" >/dev/null 2>&1 || true
+
+    # Wait until the pid file shows a NEW live pid (kickstart -k SIGKILLs, so the
+    # old socket file may linger until the fresh daemon unlinks + rebinds it).
+    local tries=0 new_pid=""
+    while [[ $tries -lt 70 ]]; do
+        sleep 0.5
+        if [[ -S "${SOCK_PATH}" && -f "${SOCK_PATH}.pid" ]]; then
+            new_pid="$(cat "${SOCK_PATH}.pid" 2>/dev/null)"
+            if [[ -n "${new_pid}" && "${new_pid}" != "${old_pid}" ]] && kill -0 "${new_pid}" 2>/dev/null; then
+                break
+            fi
+        fi
+        tries=$((tries + 1))
+    done
+
+    if [[ -n "${new_pid}" && "${new_pid}" != "${old_pid}" ]] && kill -0 "${new_pid}" 2>/dev/null; then
+        echo "speak: daemon ready (pid ${new_pid})." >&2
     else
-        echo "speak: daemon not running" >&2
+        echo "speak: daemon failed to restart" >&2
+        _log_failure "restart:socket_timeout" 1 "${TEXT:-}"
+        return 1
     fi
 }
 
@@ -727,10 +741,7 @@ if [[ "${DAEMON_CMD}" == "stop" ]]; then
 fi
 
 if [[ "${DAEMON_CMD}" == "restart" ]]; then
-    if daemon_is_running; then
-        stop_daemon
-    fi
-    start_daemon
+    restart_daemon
     exit 0
 fi
 
