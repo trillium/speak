@@ -47,6 +47,8 @@ def main():
                         help="Session ID for voice pool (default: PPID)")
     parser.add_argument("--command",
                         help="Send a queue command (queue_status, skip, clear, replay)")
+    parser.add_argument("--json", default=None,
+                        help="JSON object of extra args merged into a --command request")
     parser.add_argument("--play-tone", action="store_true",
                         help="Play the input-received tone for the current session")
     parser.add_argument("--subscribe", action="store_true",
@@ -59,10 +61,18 @@ def main():
 
     # --- Command mode (no text needed) ---
     if args.command:
-        _send_request(sock, {"command": args.command})
+        req = {"command": args.command}
+        if args.json:
+            extra = json.loads(args.json)
+            if not isinstance(extra, dict):
+                print("speak-client: --json must be a JSON object", file=sys.stderr)
+                sock.close()
+                sys.exit(1)
+            req.update(extra)
+        _send_request(sock, req)
         resp = _read_json_response(sock)
         sock.close()
-        if resp:
+        if resp is not None:
             print(json.dumps(resp, indent=2))
         return
 

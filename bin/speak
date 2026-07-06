@@ -608,30 +608,15 @@ while [[ $# -gt 0 ]]; do
                 echo "speak: daemon not running (start with: speak --daemon)" >&2
                 exit 1
             fi
-            python3 -c "
-import socket, struct, json, sys
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'voice_release', 'voice': '${_vr_voice}'}).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    released = resp.get('released', [])
-    if released:
-        print(f'Released {len(released)} claim(s) on ${_vr_voice}:')
-        for s in released:
-            print(f'  {s}')
-    else:
-        print(f'No active claims on ${_vr_voice}')
-sock.close()
-"
+            _vr_json="$(jq -cn --arg v "${_vr_voice}" '{voice: $v}')"
+            _vr_resp="$(python3 "${SCRIPT_DIR}/speak-client" --command voice_release --json "${_vr_json}")"
+            _vr_count="$(printf '%s' "${_vr_resp}" | jq -r '(.released // []) | length')"
+            if [[ "${_vr_count}" -gt 0 ]]; then
+                echo "Released ${_vr_count} claim(s) on ${_vr_voice}:"
+                printf '%s' "${_vr_resp}" | jq -r '.released[] | "  \(.)"'
+            else
+                echo "No active claims on ${_vr_voice}"
+            fi
             exit 0
             ;;
         --voice-reject)
@@ -667,26 +652,11 @@ sock.close()
                 && mv "${_vj_tmp}" "${_vj_file}"
             # Step 2: Release claims via daemon (if running)
             if daemon_is_running; then
-                python3 -c "
-import socket, struct, json
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'voice_release', 'voice': '${_vj_voice}'}).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    released = resp.get('released', [])
-    if released:
-        print(f'Released {len(released)} session(s) from ${_vj_voice}')
-sock.close()
-"
+                _vj_json="$(jq -cn --arg v "${_vj_voice}" '{voice: $v}')"
+                _vj_count="$(python3 "${SCRIPT_DIR}/speak-client" --command voice_release --json "${_vj_json}" | jq -r '(.released // []) | length')"
+                if [[ "${_vj_count}" -gt 0 ]]; then
+                    echo "Released ${_vj_count} session(s) from ${_vj_voice}"
+                fi
             fi
             echo "Rejected ${_vj_voice} — deprioritized and released. New voice assigned on next enqueue."
             exit 0
@@ -757,17 +727,7 @@ fi
 
 # --- Handle --devices (list audio output devices, no daemon needed) ---
 if [[ "${LIST_DEVICES}" == true ]]; then
-    uv run --python 3.14 --with sounddevice -- python3 -c "
-import sounddevice as sd
-devices = sd.query_devices()
-default_out = sd.default.device[1]
-for i, d in enumerate(devices):
-    if d['max_output_channels'] > 0:
-        marker = ' *' if i == default_out else ''
-        print(f\"  {i:>3}  {d['name']}  ({d['max_output_channels']}ch){marker}\")
-print()
-print('  * = default output device')
-"
+    uv run --python 3.14 --with sounddevice -- python3 "${SCRIPT_DIR}/speak-list-devices"
     exit 0
 fi
 
@@ -777,35 +737,19 @@ if [[ -n "${SET_DEVICE:-}" ]]; then
         echo "speak: daemon not running (start with: speak --daemon)" >&2
         exit 1
     fi
-    # Try to parse as int, else send as string
-    python3 -c "
-import socket, struct, json, sys
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-device = '${SET_DEVICE}'
-try:
-    device = int(device)
-except ValueError:
-    pass
-msg = json.dumps({'command': 'set_device', 'device': device}).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    if resp.get('ok'):
-        d = resp['device']
-        print(f\"speak: switched to device {d['index']} ({d['name']})\")
-    else:
-        print(f\"speak: error: {resp.get('error', 'unknown')}\", file=sys.stderr)
-        sys.exit(1)
-sock.close()
-"
+    # Parse as int when numeric, else send as a device-name string.
+    if [[ "${SET_DEVICE}" =~ ^[0-9]+$ ]]; then
+        _sd_json="$(jq -cn --argjson d "${SET_DEVICE}" '{device: $d}')"
+    else
+        _sd_json="$(jq -cn --arg d "${SET_DEVICE}" '{device: $d}')"
+    fi
+    _sd_resp="$(python3 "${SCRIPT_DIR}/speak-client" --command set_device --json "${_sd_json}")"
+    if [[ "$(printf '%s' "${_sd_resp}" | jq -r '.ok')" == "true" ]]; then
+        printf '%s' "${_sd_resp}" | jq -r '"speak: switched to device \(.device.index) (\(.device.name))"'
+    else
+        echo "speak: error: $(printf '%s' "${_sd_resp}" | jq -r '.error // "unknown"')" >&2
+        exit 1
+    fi
     exit 0
 fi
 
@@ -815,28 +759,12 @@ if [[ -n "${REPLAY_ID:-}" ]]; then
         echo "speak: daemon not running (start with: speak --daemon)" >&2
         exit 1
     fi
-    python3 -c "
-import socket, struct, json, sys
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-cmd = {'command': 'replay_by_id', 'id': ${REPLAY_ID}}
-clause = '${REPLAY_CLAUSE:-}'
-if clause:
-    cmd['from_clause'] = int(clause)
-msg = json.dumps(cmd).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    print(json.dumps(resp, indent=2))
-sock.close()
-"
+    if [[ -n "${REPLAY_CLAUSE:-}" ]]; then
+        _ri_json="$(jq -cn --argjson id "${REPLAY_ID}" --argjson fc "${REPLAY_CLAUSE}" '{id: $id, from_clause: $fc}')"
+    else
+        _ri_json="$(jq -cn --argjson id "${REPLAY_ID}" '{id: $id}')"
+    fi
+    python3 "${SCRIPT_DIR}/speak-client" --command replay_by_id --json "${_ri_json}"
     exit 0
 fi
 
@@ -860,57 +788,22 @@ if [[ -n "${QUEUE_CMD}" ]]; then
         exit 1
     fi
     if [[ "${QUEUE_CMD}" == "resume_mid_clause" ]]; then
-        python3 -c "
-import socket, struct, json, sys
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-val = '${RESUME_MID_CLAUSE_VAL:-}'
-cmd = {'command': 'set_resume_mid_clause'}
-if val == 'on':
-    cmd['enabled'] = True
-elif val == 'off':
-    cmd['enabled'] = False
-msg = json.dumps(cmd).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    state = 'on' if resp.get('resume_mid_clause') else 'off'
-    if val:
-        print(f'resume-mid-clause: {state}')
-    else:
-        print(f'resume-mid-clause: {state}')
-sock.close()
-"
+        if [[ "${RESUME_MID_CLAUSE_VAL:-}" == "on" ]]; then
+            _rmc_json='{"enabled": true}'
+        elif [[ "${RESUME_MID_CLAUSE_VAL:-}" == "off" ]]; then
+            _rmc_json='{"enabled": false}'
+        else
+            _rmc_json='{}'
+        fi
+        _rmc_state="$(python3 "${SCRIPT_DIR}/speak-client" --command set_resume_mid_clause --json "${_rmc_json}" \
+            | jq -r 'if .resume_mid_clause then "on" else "off" end')"
+        echo "resume-mid-clause: ${_rmc_state}"
         exit 0
     fi
     if [[ "${QUEUE_CMD}" == "history" ]]; then
-        python3 -c "
-import socket, struct, json, os, sys
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'history', 'n': ${HISTORY_N:-10}, 'offset': ${HISTORY_OFFSET:-0}}).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-# Read response
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    json.dump({'entries': resp.get('entries', []), 'total': resp.get('total', 0)}, sys.stdout)
-    print()
-sock.close()
-"
+        _h_json="$(jq -cn --argjson n "${HISTORY_N:-10}" --argjson o "${HISTORY_OFFSET:-0}" '{n: $n, offset: $o}')"
+        python3 "${SCRIPT_DIR}/speak-client" --command history --json "${_h_json}" \
+            | jq -c '{entries: (.entries // []), total: (.total // 0)}'
     else
         python3 "${SCRIPT_DIR}/speak-client" --command "${QUEUE_CMD}"
     fi
@@ -923,25 +816,9 @@ if [[ -n "${CALLER_HISTORY_NAME:-}" ]]; then
         echo "speak: daemon not running (start with: speak --daemon)" >&2
         exit 1
     fi
-    python3 -c "
-import socket, struct, json, sys
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'caller_history', 'caller': '${CALLER_HISTORY_NAME}', 'n': ${CALLER_HISTORY_N:-10}, 'offset': ${HISTORY_OFFSET:-0}}).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    json.dump({'entries': resp.get('entries', []), 'total': resp.get('total', 0)}, sys.stdout)
-    print()
-sock.close()
-"
+    _ch_json="$(jq -cn --arg c "${CALLER_HISTORY_NAME}" --argjson n "${CALLER_HISTORY_N:-10}" --argjson o "${HISTORY_OFFSET:-0}" '{caller: $c, n: $n, offset: $o}')"
+    python3 "${SCRIPT_DIR}/speak-client" --command caller_history --json "${_ch_json}" \
+        | jq -c '{entries: (.entries // []), total: (.total // 0)}'
     exit 0
 fi
 
@@ -951,26 +828,9 @@ if [[ -n "${SESSION_HISTORY_ID:-}" ]]; then
         echo "speak: daemon not running (start with: speak --daemon)" >&2
         exit 1
     fi
-    python3 -c "
-import socket, struct, json, sys
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'session_history', 'session': '${SESSION_HISTORY_ID}', 'n': ${SESSION_HISTORY_N:-10}}).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    entries = resp.get('entries', [])
-    json.dump(entries, sys.stdout, indent=2)
-    print()
-sock.close()
-"
+    _sh_json="$(jq -cn --arg s "${SESSION_HISTORY_ID}" --argjson n "${SESSION_HISTORY_N:-10}" '{session: $s, n: $n}')"
+    python3 "${SCRIPT_DIR}/speak-client" --command session_history --json "${_sh_json}" \
+        | jq '.entries // []'
     exit 0
 fi
 
@@ -981,25 +841,9 @@ if [[ -n "${AGENT_SUMMARY_PID:-}" ]]; then
         exit 1
     fi
     # Query session history from daemon
-    _agent_entries="$(python3 -c "
-import socket, struct, json, sys
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'session_history', 'session': '${AGENT_SUMMARY_PID}', 'n': 50}).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    entries = resp.get('entries', [])
-    print('\n'.join(e["text"] for e in entries))
-sock.close()
-")"
+    _as_json="$(jq -cn --arg s "${AGENT_SUMMARY_PID}" '{session: $s, n: 50}')"
+    _agent_entries="$(python3 "${SCRIPT_DIR}/speak-client" --command session_history --json "${_as_json}" \
+        | jq -r '.entries[]?.text')"
     if [[ -z "${_agent_entries}" ]]; then
         "${SCRIPT_DIR}/speak" --enqueue "No history found for session ${AGENT_SUMMARY_PID}."
     else
@@ -1020,26 +864,9 @@ if [[ -n "${AGENT_REPEAT_PID:-}" ]]; then
         exit 1
     fi
     # Query session history from daemon
-    _agent_lines="$(python3 -c "
-import socket, struct, json, sys
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'session_history', 'session': '${AGENT_REPEAT_PID}', 'n': ${AGENT_REPEAT_N}}).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = b''; _rem = resp_len
-    while _rem > 0:
-        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
-        if not _chunk: break
-    resp = json.loads(data)
-    entries = resp.get('entries', [])
-    for entry in entries:
-        print(entry["text"])
-sock.close()
-")"
+    _ar_json="$(jq -cn --arg s "${AGENT_REPEAT_PID}" --argjson n "${AGENT_REPEAT_N}" '{session: $s, n: $n}')"
+    _agent_lines="$(python3 "${SCRIPT_DIR}/speak-client" --command session_history --json "${_ar_json}" \
+        | jq -r '.entries[]?.text')"
     if [[ -z "${_agent_lines}" ]]; then
         "${SCRIPT_DIR}/speak" --enqueue "No history found for session ${AGENT_REPEAT_PID}."
     else
