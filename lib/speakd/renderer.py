@@ -17,6 +17,7 @@ import time
 from typing import AsyncIterator
 
 import numpy as np
+import yaml
 
 from .config import SAMPLE_RATE
 from .playback_device import AudioOutputStream
@@ -36,18 +37,37 @@ _TRIM_CONFIG_PATH = os.path.join(
 )
 
 
+# (mtime, (gaps, default)) of the last successful trim.yaml parse, or None.
+_trim_config_cache: tuple[float, tuple[dict, int]] | None = None
+
+
 def _load_trim_config():
-    """Load trim.yaml, returning (gaps_dict, default_gap_ms)."""
-    import yaml
+    """Load trim.yaml, returning (gaps_dict, default_gap_ms).
+
+    Parsed once and cached, keyed on the file's mtime, so it is not re-read
+    per clause. Editing trim.yaml bumps the mtime and takes effect on the next
+    synthesis — hot-reload semantics are preserved.
+    """
+    global _trim_config_cache
+    try:
+        mtime = os.stat(_TRIM_CONFIG_PATH).st_mtime
+    except FileNotFoundError:
+        _trim_config_cache = None
+        return {}, 200
+
+    if _trim_config_cache is not None and _trim_config_cache[0] == mtime:
+        return _trim_config_cache[1]
 
     try:
         with open(_TRIM_CONFIG_PATH) as f:
             cfg = yaml.safe_load(f)
         gaps = cfg.get("gaps", {})
         default = cfg.get("default_gap", 200)
-        return gaps, default
     except (FileNotFoundError, yaml.YAMLError):
         return {}, 200
+
+    _trim_config_cache = (mtime, (gaps, default))
+    return gaps, default
 
 
 def _find_voice_bounds(audio):
