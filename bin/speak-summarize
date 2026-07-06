@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "..", "config", "rewrites.json")
@@ -19,41 +20,22 @@ DICTIONARY_DIR = os.path.expanduser("~/code/tts-pronunciation-dictionary")
 sys.path.insert(0, DICTIONARY_DIR)
 
 
-# Extension → spoken form mapping
-_EXT_SPEECH = {
-    ".py": " dot pie",
-    ".ts": " dot T S",
-    ".tsx": " dot T S X",
-    ".js": " dot J S",
-    ".jsx": " dot J S X",
-    ".json": " dot jason",
-    ".jsonl": " dot jason L",
-    ".yaml": " dot yammel",
-    ".yml": " dot yammel",
-    ".toml": " dot tom L",
-    ".md": " dot M D",
-    ".sh": " dot S H",
-    ".bash": " dot bash",
-    ".css": " dot C S S",
-    ".html": " dot H T M L",
-    ".sql": " dot sequel",
-    ".rs": " dot R S",
-    ".go": " dot go",
-    ".c": " dot C",
-    ".h": " dot H",
-    ".env": " dot env",
-    ".lock": " dot lock",
-    ".txt": " dot text",
-    ".log": " dot log",
-    ".wav": " dot wave",
-    ".mp3": " dot M P 3",
-    ".png": " dot P N G",
-    ".jpg": " dot J peg",
-    ".svg": " dot S V G",
-    ".onnx": " dot onyx",
-    ".wasm": " dot wasm",
-    ".db": " dot D B",
-}
+# Extension → spoken form mapping, loaded from the canonical
+# config/speech-maps.json (task-crj) — the single source of truth shared with
+# hooks/SpeakResponse.hook.ts. On any load failure we fall back to an empty map
+# and proceed; filenames then keep their generic "dot <ext>" spelling.
+_SPEECH_MAPS_PATH = Path(__file__).parent.parent / "config" / "speech-maps.json"
+
+
+def _load_ext_speech() -> dict:
+    try:
+        with open(_SPEECH_MAPS_PATH) as f:
+            return json.load(f).get("extensions", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+_EXT_SPEECH = _load_ext_speech()
 
 
 def _filename_to_speech(filename: str) -> str:

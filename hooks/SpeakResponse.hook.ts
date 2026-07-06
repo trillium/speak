@@ -17,6 +17,8 @@
 
 import { readHookInput, parseTranscriptFromInput } from './lib/hook-io';
 import { spawnSync, spawn } from 'child_process';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 
 const SPEAK = `${process.env.HOME}/code/speak/bin/speak`;
 const SPEAK_SUMMARIZE = `${process.env.HOME}/code/speak/bin/speak-summarize`;
@@ -54,66 +56,31 @@ function tablesToSpeech(text: string): string {
   return result.join('\n');
 }
 
-// Acronyms/initialisms that should be spelled out letter-by-letter
-const ACRONYM_SPEECH: Record<string, string> = {
-  'cli': 'C L I',
-  'api': 'A P I',
-  'url': 'U R L',
-  'uri': 'U R I',
-  'id': 'I D',
-  'ids': 'I D s',
-  'ui': 'U I',
-  'ux': 'U X',
-  'db': 'D B',
-  'sql': 'sequel',
-  'os': 'O S',
-  'io': 'I O',
-  'pr': 'P R',
-  'ci': 'C I',
-  'cd': 'C D',
-  'sdk': 'S D K',
-  'ssr': 'S S R',
-  'csr': 'C S R',
-  'tts': 'T T S',
-  'llm': 'L L M',
-  'pcm': 'P C M',
-};
+// Speech maps load from the canonical config/speech-maps.json (task-crj), the
+// single source of truth shared with bin/speak-summarize. On any load failure
+// we fall back to empty maps and proceed — this hook must never crash the Stop
+// event over a missing/malformed config, it just skips the pronunciation fixes.
+//   ACRONYM_SPEECH: initialisms spelled out letter-by-letter
+//   EXT_SPEECH:     file extension → spoken form
+function loadSpeechMaps(): {
+  acronyms: Record<string, string>;
+  extensions: Record<string, string>;
+} {
+  try {
+    const path = join(import.meta.dir, '..', 'config', 'speech-maps.json');
+    const data = JSON.parse(readFileSync(path, 'utf8'));
+    return {
+      acronyms: data.acronyms ?? {},
+      extensions: data.extensions ?? {},
+    };
+  } catch {
+    return { acronyms: {}, extensions: {} };
+  }
+}
 
-// Extension → spoken form mapping
-const EXT_SPEECH: Record<string, string> = {
-  '.py': ' dot pie',
-  '.ts': ' dot T S',
-  '.tsx': ' dot T S X',
-  '.js': ' dot J S',
-  '.jsx': ' dot J S X',
-  '.json': ' dot jason',
-  '.jsonl': ' dot jason L',
-  '.yaml': ' dot yammel',
-  '.yml': ' dot yammel',
-  '.toml': ' dot tom L',
-  '.md': ' dot M D',
-  '.sh': ' dot S H',
-  '.bash': ' dot bash',
-  '.css': ' dot C S S',
-  '.html': ' dot H T M L',
-  '.sql': ' dot sequel',
-  '.rs': ' dot R S',
-  '.go': ' dot go',
-  '.c': ' dot C',
-  '.h': ' dot H',
-  '.env': ' dot env',
-  '.lock': ' dot lock',
-  '.txt': ' dot text',
-  '.log': ' dot log',
-  '.wav': ' dot wave',
-  '.mp3': ' dot M P 3',
-  '.png': ' dot P N G',
-  '.jpg': ' dot J peg',
-  '.svg': ' dot S V G',
-  '.onnx': ' dot onyx',
-  '.wasm': ' dot wasm',
-  '.db': ' dot D B',
-};
+const _speechMaps = loadSpeechMaps();
+const ACRONYM_SPEECH: Record<string, string> = _speechMaps.acronyms;
+const EXT_SPEECH: Record<string, string> = _speechMaps.extensions;
 
 function filenameToSpeech(filename: string): string {
   const dotIdx = filename.lastIndexOf('.');
