@@ -11,7 +11,7 @@ import time
 from kokoro_onnx import Kokoro
 
 from .cache import AudioCache
-from .config import CACHE_DIR, CACHE_TTL_DAYS, IDLE_TIMEOUT, SOCKET_PATH
+from .config import CACHE_DIR, CACHE_TTL_DAYS, DEFAULT_SPEED, IDLE_TIMEOUT, SOCKET_PATH
 from .kokoro_patch import apply_patch
 from .playback import PlaybackQueue
 from .protocol import send_json
@@ -311,7 +311,7 @@ class SpeakDaemon:
             "text": "Speak daemon ready.",
             "enqueue": True,
             "voice": "af_heart",
-            "speed": 1.26,
+            "speed": DEFAULT_SPEED,
             "lang": "en-us",
             "caller": "",
             "session": "",

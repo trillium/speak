@@ -14,6 +14,7 @@ import time
 import traceback
 from typing import Callable
 
+from .config import DEFAULT_SPEED
 from .playback_device import AudioOutputStream
 from .history import SpeechHistory
 from .protocol import publish_state
@@ -93,7 +94,7 @@ class PlaybackQueue:
         req = {
             "text": entry["text"],
             "voice": entry["voice"] or "af_heart",
-            "speed": 1.26,
+            "speed": DEFAULT_SPEED,
             "lang": "en-us",
             "caller": entry["caller"],
             "session": entry["session"],
@@ -391,7 +392,7 @@ class PlaybackQueue:
                     import numpy as np
                     announce_text = f"{caller} here"
                     async for audio, sr in self.synth.kokoro.create_stream(
-                        announce_text, voice_name, 1.26, "en-us", trim=False
+                        announce_text, voice_name, DEFAULT_SPEED, "en-us", trim=False
                     ):
                         audio = audio.squeeze()
                         pcm_samples = (audio * 32767).astype(np.int16)

@@ -22,6 +22,7 @@ EVENT_LOG_PATH = f"/tmp/speak-{os.environ['USER']}.events.jsonl"
 
 # --- Audio ---
 SAMPLE_RATE = 24000
+DEFAULT_SPEED = 1.26  # default speech speed; bin/speak mirrors this
 CROSSFADE_MS = 5          # crossfade ramp at word joins (avoids clicks)
 SILENCE_GAP_MS = 30       # silence inserted between assembled words
 CROSSFADE_SAMPLES = int(SAMPLE_RATE * CROSSFADE_MS / 1000)
