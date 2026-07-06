@@ -328,7 +328,6 @@ async def render_speech(
 
             # Text segment
             seg_clauses = split_clauses(seg_content)
-            start_i = 0
 
             if not prefetch_consumed and first_chunks:
                 # Play the prefetched first clause
@@ -344,7 +343,6 @@ async def render_speech(
                     trimmed = trim_clause_audio(full_audio, split_char, None, is_first=True)
                     await _play_audio(trimmed)
                     prev_split_char = split_char
-                start_i = 1
                 prefetch_consumed = True
 
                 # remaining_clauses from prefetch are already the tail of this segment

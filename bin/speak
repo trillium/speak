@@ -12,7 +12,7 @@ SPEED="1.26"
 SAVE_FILE=""
 VOICE=""
 CALLER="${SPEAK_CALLER:-}"
-ENQUEUE_BACKEND="${SPEAK_ENQUEUE_BACKEND:-auto}"  # auto, c, perl, python
+ENQUEUE_BACKEND="${SPEAK_ENQUEUE_BACKEND:-auto}"  # auto, c, python
 DEVICE=""
 FLAGGED_FILE="${SCRIPT_DIR}/../config/flagged.json"
 MUTE_FILE="/tmp/speak-${USER}.muted"
@@ -1063,8 +1063,6 @@ speak_kokoro() {
         if [[ "${backend}" == "auto" ]]; then
             if [[ -x "${SCRIPT_DIR}/speak-enqueue" ]]; then
                 backend="c"
-            elif command -v perl >/dev/null 2>&1; then
-                backend="perl"
             else
                 backend="python"
             fi
@@ -1079,14 +1077,6 @@ speak_kokoro() {
                 printf '%s' "${TEXT}" | "${SCRIPT_DIR}/speak-enqueue" \
                     -v "${VOICE}" -s "${SPEED}" -S "${SESSION}" "${caller_flag[@]}"
                 ;;
-            perl)
-                local caller_flag=()
-                if [[ -n "${CALLER}" ]]; then
-                    caller_flag=(-c "${CALLER}")
-                fi
-                printf '%s' "${TEXT}" | "${SCRIPT_DIR}/speak-enqueue-perl" \
-                    -v "${VOICE}" -s "${SPEED}" -S "${SESSION}" "${caller_flag[@]}"
-                ;;
             python)
                 local caller_flag=()
                 if [[ -n "${CALLER}" ]]; then
@@ -1097,7 +1087,7 @@ speak_kokoro() {
                     --session "${SESSION}" "${caller_flag[@]}"
                 ;;
             *)
-                echo "speak: unknown enqueue backend '${backend}' (use c, perl, or python)" >&2
+                echo "speak: unknown enqueue backend '${backend}' (use c or python)" >&2
                 exit 1
                 ;;
         esac
