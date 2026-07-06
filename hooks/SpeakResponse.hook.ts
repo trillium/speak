@@ -207,7 +207,10 @@ const BLOB_RULES: BlobRule[] = [
   // 7. Short SHA (7–12 hex chars) — replaces existing silent strip
   {
     name: 'sha-short',
-    pattern: /\(?[0-9a-f]{7,12}\)?/gi,
+    // Anchor on word boundaries and require at least one digit so hex-lettered
+    // English words (acceded, defaced) don't match; HEX_WORD_EXCEPTIONS stays
+    // as belt-and-suspenders.
+    pattern: /\(?\b(?=[0-9a-f]*\d)[0-9a-f]{7,12}\b\)?/gi,
     replacement: (m: string) => {
       const word = m.replace(/[()]/g, '').toLowerCase();
       if (HEX_WORD_EXCEPTIONS.has(word)) return m;
