@@ -47,6 +47,8 @@ def main():
                         help="Session ID for voice pool (default: PPID)")
     parser.add_argument("--command",
                         help="Send a queue command (queue_status, skip, clear, replay)")
+    parser.add_argument("--play-tone", action="store_true",
+                        help="Play the input-received tone for the current session")
     parser.add_argument("--subscribe", action="store_true",
                         help="Subscribe to audio broadcast (PCM to stdout, metadata to stderr)")
     args = parser.parse_args()
@@ -62,6 +64,13 @@ def main():
         sock.close()
         if resp:
             print(json.dumps(resp, indent=2))
+        return
+
+    # --- Play tone mode (session-keyed pluck tone) ---
+    if args.play_tone:
+        _send_request(sock, {"command": "play_tone", "session": args.session})
+        resp = _read_json_response(sock)
+        sock.close()
         return
 
     # --- Subscribe mode ---

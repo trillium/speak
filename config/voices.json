@@ -3,7 +3,14 @@
     "speak": {
       "voice": "af_heart",
       "gain": 1.0
+    },
+    ".talon": {
+      "voice": "am_adam",
+      "gain": 1.0
     }
   },
-  "weights": {}
+  "weights": {
+    "bm_george": 100,
+    "af_alloy": 100
+  }
 }

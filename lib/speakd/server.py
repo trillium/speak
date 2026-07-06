@@ -77,6 +77,13 @@ class SpeakDaemon:
                     result = await self.playback_queue.toggle_pause()
                 elif command == "replay":
                     result = await self.playback_queue.replay()
+                elif command == "replay_by_id":
+                    row_id = request.get("id")
+                    if row_id is None:
+                        result = {"ok": False, "error": "replay_by_id requires 'id' field"}
+                    else:
+                        from_clause = request.get("from_clause")
+                        result = await self.playback_queue.replay_by_id(int(row_id), from_clause=from_clause)
                 elif command == "stats":
                     q = self.playback_queue
                     result = {
@@ -91,6 +98,7 @@ class SpeakDaemon:
                             "total_skipped": q.total_skipped,
                             "pending": q._queue.qsize(),
                             "playing": q._current.get("text", "")[:80] if q._current else None,
+                            "resume_mid_clause": q._resume_mid_clause,
                         },
                         "cache": self.cache.stats(),
                         "subscribers": self.subscriber_manager.status(),
@@ -152,15 +160,35 @@ class SpeakDaemon:
                             result = {"ok": False, "error": str(e)}
                 elif command == "history":
                     n = request.get("n", 10)
-                    result = {"ok": True, "entries": self.playback_queue.get_history(n)}
+                    offset = request.get("offset", 0)
+                    entries, total = self.playback_queue._history.get(n, offset)
+                    result = {"ok": True, "entries": entries, "total": total}
                 elif command == "session_history":
                     session = request.get("session", "")
                     n = request.get("n", 10)
-                    result = {"ok": True, "entries": self.playback_queue.get_history_by_session(session, n)}
+                    offset = request.get("offset", 0)
+                    entries, total = self.playback_queue._history.get_by_session(session, n, offset)
+                    result = {"ok": True, "entries": entries, "total": total}
                 elif command == "caller_history":
                     caller = request.get("caller", "")
                     n = request.get("n", 10)
-                    result = {"ok": True, "entries": self.playback_queue.get_history_by_caller(caller, n)}
+                    offset = request.get("offset", 0)
+                    entries, total = self.playback_queue._history.get_by_caller(caller, n, offset)
+                    result = {"ok": True, "entries": entries, "total": total}
+                elif command == "caller_voice":
+                    caller = request.get("caller", "")
+                    if not caller:
+                        result = {"ok": False, "error": "caller_voice requires 'caller' field"}
+                    else:
+                        voice = self.playback_queue._history.last_voice_for_caller(caller)
+                        result = {"ok": True, "caller": caller, "voice": voice}
+                elif command == "set_resume_mid_clause":
+                    enabled = request.get("enabled")
+                    if enabled is None:
+                        result = {"ok": True, "resume_mid_clause": self.playback_queue._resume_mid_clause}
+                    else:
+                        self.playback_queue._resume_mid_clause = bool(enabled)
+                        result = {"ok": True, "resume_mid_clause": self.playback_queue._resume_mid_clause}
                 elif command == "subscribe":
                     include_metadata = request.get("include_metadata", True)
                     send_json(writer, {
@@ -184,6 +212,16 @@ class SpeakDaemon:
                     # Keep connection alive until subscriber disconnects
                     await info.disconnect_event.wait()
                     return
+                elif command == "play_tone":
+                    session = request.get("session", "")
+                    waveform = request.get("waveform", "pluck")
+                    if not session:
+                        result = {"ok": False, "error": "play_tone requires 'session' field"}
+                    else:
+                        from .tones import get_input_tone, get_caller_tone
+                        tone_pcm = get_input_tone(session) if waveform == "pluck" else get_caller_tone(session)
+                        await self.playback_queue._ffplay.write_pcm(tone_pcm)
+                        result = {"ok": True, "session": session, "waveform": waveform}
                 else:
                     result = {"ok": False, "error": f"unknown command: {command}"}
                 send_json(writer, result)
@@ -192,7 +230,8 @@ class SpeakDaemon:
 
             # --- Enqueue dispatch (fire-and-forget) ---
             if request.get("enqueue"):
-                position = await self.playback_queue.enqueue(request)
+                priority = request.get("priority", False)
+                position = await self.playback_queue.enqueue(request, priority=priority)
                 send_json(writer, {"ok": True, "position": position})
                 await writer.drain()
                 return
@@ -266,6 +305,18 @@ class SpeakDaemon:
                     print(f"speak-daemon: evicted {removed} expired cache entries", file=sys.stderr)
                 last_evict = time.monotonic()
 
+    async def _startup_announce(self):
+        """Announce startup, jumping to front of queue."""
+        await self.playback_queue.enqueue({
+            "text": "Speak daemon ready.",
+            "enqueue": True,
+            "voice": "af_heart",
+            "speed": 1.26,
+            "lang": "en-us",
+            "caller": "",
+            "session": "",
+        }, priority=True)
+
     async def run(self):
         # Clean up stale socket
         if os.path.exists(SOCKET_PATH):
@@ -290,16 +341,8 @@ class SpeakDaemon:
         self.playback_queue.start()
         asyncio.create_task(self.idle_watchdog())
 
-        # Announce startup so the user knows the daemon is ready
-        await self.playback_queue.enqueue({
-            "text": "Speak daemon ready.",
-            "enqueue": True,
-            "voice": "af_heart",
-            "speed": 1.26,
-            "lang": "en-us",
-            "caller": "",
-            "session": "",
-        })
+        # Announce startup — schedule as task so server.serve_forever() starts first
+        asyncio.create_task(self._startup_announce())
 
         async with server:
             await server.serve_forever()

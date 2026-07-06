@@ -59,9 +59,14 @@ class PlaybackQueue:
         self._paused = False
         self._resume_event = asyncio.Event()
         self._resume_event.set()  # starts unblocked
+        self._priority_request = None  # jump-the-line item
+        self._resume_mid_clause = True  # toggle: resume from interrupted clause vs. start
 
-    def record_history(self, text: str, caller: str = "", session: str = ""):
-        self._history.record(text, caller=caller, session=session)
+    def record_history(self, text: str, caller: str = "", session: str = "") -> int:
+        return self._history.record(text, caller=caller, session=session)
+
+    def update_history_voice(self, row_id: int, voice: str):
+        self._history.update_voice(row_id, voice)
 
     def get_history(self, n: int = 10) -> list[str]:
         return self._history.get(n)
@@ -71,6 +76,37 @@ class PlaybackQueue:
 
     def get_history_by_caller(self, caller: str, n: int = 10) -> list[str]:
         return self._history.get_by_caller(caller, n)
+
+    def get_history_by_id(self, row_id: int) -> dict | None:
+        return self._history.get_by_id(row_id)
+
+    async def replay_by_id(self, row_id: int, from_clause: int | None = None) -> dict:
+        """Replay a history entry by ID using its original voice.
+
+        If from_clause is given, playback starts from that clause index.
+        """
+        entry = self._history.get_by_id(row_id)
+        if entry is None:
+            return {"ok": False, "error": f"history id {row_id} not found"}
+        req = {
+            "text": entry["text"],
+            "voice": entry["voice"] or "af_heart",
+            "speed": 1.26,
+            "lang": "en-us",
+            "caller": entry["caller"],
+            "session": entry["session"],
+            "enqueue": True,
+            "_fixed_voice": True,   # bypass voice pool
+            "_skip_history": True,  # don't record again
+        }
+        if from_clause is not None:
+            req["_resume_from_clause"] = int(from_clause)
+        self._id_counter += 1
+        self.total_enqueued += 1
+        req["_queue_id"] = self._id_counter
+        await self._queue.put(req)
+        self._publish("enqueued", enqueued_id=self._id_counter)
+        return {"ok": True, "id": row_id, "text": entry["text"][:80], "from_clause": from_clause}
 
     async def set_device(self, device):
         """Switch audio output device at runtime."""
@@ -83,11 +119,18 @@ class PlaybackQueue:
     def is_active(self) -> bool:
         return self._current is not None or not self._queue.empty() or self._paused
 
-    async def enqueue(self, request: dict) -> int:
+    async def enqueue(self, request: dict, priority: bool = False) -> int:
         self._id_counter += 1
         self.total_enqueued += 1
         request["_queue_id"] = self._id_counter
-        await self._queue.put(request)
+        if priority:
+            # Stash as next-up item (worker checks before queue)
+            self._priority_request = request
+            # Also put a dummy in the queue to wake the worker if it's
+            # blocked on queue.get()
+            await self._queue.put({"_priority_wakeup": True})
+        else:
+            await self._queue.put(request)
         self._publish("enqueued", enqueued_id=self._id_counter)
         return self._queue.qsize()
 
@@ -180,11 +223,15 @@ class PlaybackQueue:
             result["playing"] = {
                 "id": self._current.get("_queue_id"),
                 "text": self._current.get("text", "")[:80],
+                "history_id": self._current.get("_history_id"),
+                "clause_idx": self._current.get("_clause_idx"),
+                "clause_text": self._current.get("_clause_text", ""),
             }
         elif self._paused and self._paused_request is not None:
             result["playing"] = {
                 "id": self._paused_request.get("_queue_id"),
                 "text": self._paused_request.get("text", "")[:80],
+                "history_id": self._paused_request.get("_history_id"),
                 "paused": True,
             }
         return result
@@ -206,6 +253,8 @@ class PlaybackQueue:
                 "caller": self._current.get("caller", ""),
                 "voice": self._current.get("_resolved_voice", ""),
                 "text": self._current.get("text", "")[:120],
+                "history_id": self._current.get("_history_id"),
+                "clause_idx": self._current.get("_clause_idx"),
             }
         state.update(extra)
         publish_state(state)
@@ -217,12 +266,15 @@ class PlaybackQueue:
         self._publish("idle")
         self._paused_request = None  # holds item to replay after resume
         while True:
-            # Paused item gets priority over queue
+            # Priority: paused replay > priority enqueue > normal queue
             if self._paused_request is not None:
                 # Wait for resume before replaying stashed item
                 await self._resume_event.wait()
                 request = self._paused_request
                 self._paused_request = None
+            elif self._priority_request is not None:
+                request = self._priority_request
+                self._priority_request = None
             else:
                 # Wait for resume before pulling from queue, so items stay
                 # visible to clear() while paused. Also check again after
@@ -234,18 +286,24 @@ class PlaybackQueue:
                     self._paused_request = request
                     request["_is_resume"] = True
                     continue
+                # Skip wakeup dummies from priority enqueue
+                if request.get("_priority_wakeup"):
+                    continue
             self._current = request
             self._skip_flag = False
+            chunks_done = 0  # tracks clause progress for resume-from-clause
             is_resume = request.get("_is_resume", False)
+            skip_history = request.get("_skip_history", False)
             # Record in history early so queries see it before playback finishes
-            # (but not on resume — already recorded)
+            # (but not on resume or replay-by-id — already recorded)
             text_for_history = request.get("text", "")
-            if text_for_history and not is_resume:
-                self.record_history(
+            if text_for_history and not is_resume and not skip_history:
+                row_id = self.record_history(
                     text_for_history,
                     caller=request.get("caller", ""),
                     session=request.get("session", ""),
                 )
+                request["_history_id"] = row_id
             try:
                 caller = request.get("caller")
                 # Spacing between items:
@@ -265,12 +323,20 @@ class PlaybackQueue:
                 session = request.get("session", "")
                 is_new_claim = False
                 gain = 1.0
-                if caller and self.voice_pool:
+                if request.get("_fixed_voice"):
+                    # Replay-by-id: use the voice from the request, skip pool
+                    pass
+                elif caller and self.voice_pool:
                     voice_name, gain, is_new_claim = self.voice_pool.get_voice(
                         caller, session, voice_name
                     )
                 request["_resolved_voice"] = voice_name
                 request["_gain"] = gain
+
+                # Update history row with resolved voice
+                history_id = request.get("_history_id")
+                if history_id:
+                    self.update_history_voice(history_id, voice_name)
 
                 # Kick off TTS synthesis (prefetch first chunk) concurrently
                 # with the caller tone so speech is ready when tone ends.
@@ -296,8 +362,17 @@ class PlaybackQueue:
                     nonlocal t_first_speech_write
                     t_first_speech_write = time.monotonic()
 
+                def _on_clause_start(idx: int, text: str) -> None:
+                    if self._current:
+                        self._current["_clause_idx"] = idx
+                        self._current["_clause_text"] = text[:80]
+
+                resume_from_clause = request.get("_resume_from_clause", 0)
+
                 prefetch_task = None
-                if text:
+                if text and resume_from_clause == 0:
+                    # Only prefetch when starting from the beginning;
+                    # resuming mid-clause skips the first clause anyway.
                     t_prefetch_start = time.monotonic()
                     prefetch_task = asyncio.create_task(
                         prefetch_first_chunk(self.synth, text, voice_name, speed, lang)
@@ -347,12 +422,14 @@ class PlaybackQueue:
                         )
 
                 # The actual speech (uses prefetched first chunk if available)
-                await render_speech(
+                chunks_done = await render_speech(
                     request, loop, self.synth, self._ffplay,
                     skip_flag_fn=lambda: self._skip_flag,
                     bg_task_tracker=self._bg_task_tracker,
                     prefetch=prefetch,
                     on_first_write=_on_first_speech_write,
+                    resume_from_clause=resume_from_clause,
+                    on_clause_start=_on_clause_start,
                 )
 
                 # --- TIMING summary ---
@@ -391,8 +468,16 @@ class PlaybackQueue:
                 # If this was a pause, stash the item for replay on resume
                 if self._paused:
                     request["_is_resume"] = True
+                    if self._resume_mid_clause:
+                        request["_resume_from_clause"] = chunks_done
+                        print(
+                            f"speak-daemon: paused — will resume from clause {chunks_done}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        request.pop("_resume_from_clause", None)
+                        print(f"speak-daemon: paused — will replay from start", file=sys.stderr)
                     self._paused_request = request
-                    print(f"speak-daemon: paused — will replay on resume", file=sys.stderr)
 
                 self._current = None
                 self._on_activity()

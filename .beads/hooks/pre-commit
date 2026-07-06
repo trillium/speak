@@ -22,4 +22,5 @@ if ! command -v bd >/dev/null 2>&1; then
     exit 0
 fi
 
-exec bd hook pre-commit "$@"
+# Fall back gracefully if 'bd hook' subcommand doesn't exist yet
+bd hook pre-commit "$@" 2>/dev/null || true

@@ -19,6 +19,66 @@ DICTIONARY_DIR = os.path.expanduser("~/code/tts-pronunciation-dictionary")
 sys.path.insert(0, DICTIONARY_DIR)
 
 
+# Extension → spoken form mapping
+_EXT_SPEECH = {
+    ".py": " dot pie",
+    ".ts": " dot T S",
+    ".tsx": " dot T S X",
+    ".js": " dot J S",
+    ".jsx": " dot J S X",
+    ".json": " dot jason",
+    ".jsonl": " dot jason L",
+    ".yaml": " dot yammel",
+    ".yml": " dot yammel",
+    ".toml": " dot tom L",
+    ".md": " dot M D",
+    ".sh": " dot S H",
+    ".bash": " dot bash",
+    ".css": " dot C S S",
+    ".html": " dot H T M L",
+    ".sql": " dot sequel",
+    ".rs": " dot R S",
+    ".go": " dot go",
+    ".c": " dot C",
+    ".h": " dot H",
+    ".env": " dot env",
+    ".lock": " dot lock",
+    ".txt": " dot text",
+    ".log": " dot log",
+    ".wav": " dot wave",
+    ".mp3": " dot M P 3",
+    ".png": " dot P N G",
+    ".jpg": " dot J peg",
+    ".svg": " dot S V G",
+    ".onnx": " dot onyx",
+    ".wasm": " dot wasm",
+    ".db": " dot D B",
+}
+
+
+def _filename_to_speech(filename: str) -> str:
+    """Convert a filename to spoken form: 'server.py' → 'server dot pie'."""
+    dot_idx = filename.rfind(".")
+    if dot_idx <= 0:
+        return filename
+    ext = filename[dot_idx:].lower()
+    name = filename[:dot_idx]
+    spoken = _EXT_SPEECH.get(ext)
+    if spoken:
+        return name + spoken
+    return name + " dot " + ext[1:]
+
+
+def _filenames_in_text(text: str) -> str:
+    """Replace filenames (word.ext) with spoken form throughout text."""
+    return re.sub(
+        r'\b([\w][\w.-]*)\.(py|ts|tsx|js|jsx|json|jsonl|yaml|yml|toml|md|sh|bash|'
+        r'css|html|sql|rs|go|c|h|env|lock|txt|log|wav|mp3|png|jpg|svg|onnx|wasm|db)\b',
+        lambda m: _filename_to_speech(m.group(0)),
+        text,
+    )
+
+
 def _load_local_overrides() -> dict:
     """Load speak-specific overrides from config/rewrites.json."""
     try:
@@ -26,6 +86,54 @@ def _load_local_overrides() -> dict:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+def _tables_to_speech(text: str) -> str:
+    """Convert markdown tables to spoken sentences.
+
+    A table like:
+        | Layer | Limit | Type |
+        |---|---|---|
+        | hook.ts | 500 chars | slice |
+        | summarize | 25 words | LLM |
+
+    Becomes:
+        Layer: hook.ts, Limit: 500 chars, Type: slice.
+        Layer: summarize, Limit: 25 words, Type: LLM.
+    """
+    lines = text.split("\n")
+    result = []
+    headers = []
+    in_table = False
+
+    for line in lines:
+        stripped = line.strip()
+        # Detect table rows: must start and end with |
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            # Separator row (|---|---|) — skip
+            if all(re.match(r'^[-: ]+$', c) for c in cells):
+                continue
+            # Header row — capture column names
+            if not in_table:
+                headers = cells
+                in_table = True
+                continue
+            # Data row — pair with headers
+            if headers and len(cells) == len(headers):
+                parts = [f"{h}, {c}" for h, c in zip(headers, cells) if c]
+                result.append(". ".join(parts) + ".")
+            else:
+                # No headers or mismatched columns — just join cells
+                result.append(", ".join(c for c in cells if c) + ".")
+        else:
+            # Not a table row — reset table state and keep line
+            if in_table:
+                in_table = False
+                headers = []
+            result.append(line)
+
+    return "\n".join(result)
 
 
 def _apply_local_pronunciation(text: str, pronunciation: dict) -> str:
@@ -48,7 +156,37 @@ def main():
     if not text:
         return
 
-    # Primary: shared dictionary pipeline (camelCase, acronyms, verb stress,
+    # Load local overrides first — needed before preprocessing
+    local = _load_local_overrides()
+
+    # PHASE 0: Convert markdown tables to spoken sentences
+    text = _tables_to_speech(text)
+
+    # PHASE 1: Phrase rewrites (emoji → spoken text, filler removal)
+    # Must run before preprocess() so "TASK", "CHANGE" etc. aren't treated as acronyms
+    local_phrases = local.get("phrase_rewrites", {})
+    if local_phrases:
+        for phrase, replacement in local_phrases.items():
+            text = text.replace(phrase, replacement)
+        text = re.sub(r"  +", " ", text).strip()
+
+    # PHASE 2: Regex rewrites (code blocks, backticks, paths, URLs, tables)
+    # Must run before preprocess() so inline code is extracted first
+    regex_rewrites = local.get("regex_rewrites", {})
+    if regex_rewrites:
+        for pattern, replacement in regex_rewrites.items():
+            try:
+                text = re.sub(pattern, replacement, text, flags=re.MULTILINE)
+            except re.error:
+                pass  # skip malformed patterns
+        text = re.sub(r"  +", " ", text).strip()
+
+    # PHASE 2.5: Convert filenames to spoken form (server.py → server dot pie)
+    # Must run after backticks are stripped (phase 2) but before preprocess
+    # spells out extensions as acronyms
+    text = _filenames_in_text(text)
+
+    # PHASE 3: Shared dictionary pipeline (camelCase, acronyms, verb stress,
     # compound splitting, noise stripping, filler removal, colon pauses)
     try:
         from preprocess import preprocess
@@ -65,19 +203,10 @@ def main():
         text = re.sub(r'(/[\w./-]{20,})', 'the file', text)
         text = re.sub(r'  +', ' ', text)
 
-    # Secondary: apply any speak-local overrides on top
-    local = _load_local_overrides()
+    # PHASE 4: Local pronunciation overrides (on top of shared dictionary)
     local_pron = local.get("pronunciation", {})
     if local_pron:
         text = _apply_local_pronunciation(text, local_pron)
-
-    # Local phrase rewrites (already applied by shared tool if in flat.json,
-    # but speak may have its own additions)
-    local_phrases = local.get("phrase_rewrites", {})
-    if local_phrases:
-        for phrase, replacement in local_phrases.items():
-            text = re.sub(re.escape(phrase), replacement, text)
-        text = re.sub(r"  +", " ", text).strip()
 
     if text:
         print(text)

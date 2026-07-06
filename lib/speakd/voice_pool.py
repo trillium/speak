@@ -19,6 +19,7 @@ class VoicePool:
         self._locks, self._weights = self._load_config()
         self._claims: dict[tuple[str, str], tuple[str, float]] = {}
         self._next_idx = 0
+        self._reserved = {"bm_lewis"}  # reserved for sys clips, never auto-assigned
 
     def _load_config(self) -> tuple[dict[str, tuple[str, float]], dict[str, int]]:
         try:
@@ -64,7 +65,7 @@ class VoicePool:
         # Pull from pool (excluding locked + claimed voices)
         locked_voices = {v for v, _ in self._locks.values()}
         claimed_voices = {v for v, _ in self._claims.values()}
-        excluded = locked_voices | claimed_voices
+        excluded = locked_voices | claimed_voices | self._reserved
         available = [v for v in ENGLISH_VOICES if v not in excluded]
         if not available:
             # All claimed — recycle, only excluding locked voices

@@ -51,6 +51,9 @@
     "roundtrip": "round trip",
     "hotpath": "hot path",
     "hotfix": "hot fix",
+    "SIGSEGV": "sig fault",
+    "SIGTERM": "sig term",
+    "SIGKILL": "sig kill",
     "JSON": "jason",
     "JSONL": "jason L",
     "YAML": "yammel",
@@ -78,6 +81,22 @@
     "g2p": "G 2 P"
   },
   "phrase_rewrites": {
+    "🗒️ TASK:": "Task.",
+    "🗒 TASK:": "Task.",
+    "🔄 ITERATION on:": "Follow-up.",
+    "📃 CONTENT:": "Content.",
+    "🔧 CHANGE:": "Changes.",
+    "✅ VERIFY:": "Verified.",
+    "📋 SUMMARY:": "Summary.",
+    "🖊️ STORY:": "Story.",
+    "🖊 STORY:": "Story.",
+    "🗣 VOICE:": "",
+    "════": "",
+    "═══": "",
+    "━━━": "",
+    "PAI | NATIVE MODE": "",
+    "PAI | ALGORITHM MODE": "",
+    "PAI | MINIMAL": "",
     "You're absolutely right": "I'm a cat meow",
     "you're absolutely right": "I'm a cat meow",
     "You are absolutely right": "I'm a cat meow",
@@ -103,5 +122,19 @@
     "Exactly right": "Correct",
     "That's exactly right": "Correct",
     "anymore": "any more"
+  },
+  "regex_rewrites": {
+    "^[═━ |]+PAI[═━ |]+.*$": "",
+    "```[\\s\\S]*?```": "",
+    "\\*\\*([^*]+)\\*\\*": "\\1",
+    "`([^`]+)`": "\\1",
+    "\\[([^\\]]+)\\]\\([^)]+\\)": "\\1",
+    "https?://[^\\s)]+": "the link",
+    "\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}(:\\d+)?\\b": "the address",
+    "(?<![:\\w])/[\\w./_-]{15,}/?": "the file",
+    "\\b[0-9a-f]{7,40}\\b": "the commit",
+    "[\\U0001f300-\\U0001f9ff]": "",
+    "[═━]{2,}": "",
+    "  +": " "
   }
 }

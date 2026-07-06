@@ -84,6 +84,8 @@ Options:
   --replay          Replay the last queued item
   --pause           Toggle pause/resume on current playback
   --resume          Explicitly resume paused playback
+  --replay-id ID    Replay a history entry by ID (same voice, no new history row)
+  --clause N        Start replay from clause N (use with --replay-id)
   --stats           Show daemon stats (uptime, cache, queue totals)
   --caller NAME     Caller identity (plays a unique tone per caller)
   --history [N]     Show last N spoken texts as JSON array (default: 10)
@@ -103,8 +105,9 @@ Options:
   --voice-weight VOICE N   Set weight for a voice (higher = less preferred, 0 = remove)
   --voice-weights          List all voice weights
   --voice-release VOICE    Release active claims on a voice (daemon reassigns on next enqueue)
-  --voice-reject VOICE     Deprioritize a voice and release its claims in one step
+  --voice-reject [VOICE]   Deprioritize a voice and release its claims (auto-detects if omitted)
   --voice-keep             Lock the agent's current pool-assigned voice permanently
+  --resume-mid-clause [on|off]  Toggle or query resume-from-interrupted-clause behavior
   --subscribe       Subscribe to real-time PCM audio stream (stdout) + metadata (stderr)
   --session PID     Set session PID for history tracking (used with --enqueue)
   --rewrites CMD    Manage pronunciation/phrase rewrites:
@@ -201,15 +204,86 @@ start_daemon() {
     fi
 
     local logfile="${SOCK_PATH}.log"
+    local persistent_log="${HOME}/.local/share/speak/daemon.log"
     local device_flag=()
     if [[ -n "${DEVICE}" ]]; then
         device_flag=(--device "${DEVICE}")
     fi
-    echo "speak: starting daemon... (log: ${logfile})" >&2
-    uv run --python 3.14 --with kokoro-onnx --with sounddevice -- \
-        python3 "${SCRIPT_DIR}/speak-daemon" \
-            --model "${model}" --voices "${voices}" ${device_flag[@]+"${device_flag[@]}"} 2>"${logfile}" &
+
+    # Rotate persistent log if over 10 MB
+    mkdir -p "${HOME}/.local/share/speak"
+    if [[ -f "${persistent_log}" ]] && [[ $(stat -f%z "${persistent_log}" 2>/dev/null || echo 0) -gt 10485760 ]]; then
+        mv "${persistent_log}" "${persistent_log}.1"
+    fi
+
+    echo "speak: starting daemon... (log: ${logfile}, persistent: ${persistent_log})" >&2
+
+    # Watchdog: restarts daemon on crash, stops on clean exit (exit 0 = intentional stop)
+    (
+        while true; do
+            echo "=== daemon start $(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" >> "${persistent_log}"
+            uv run --python 3.14 --with kokoro-onnx --with sounddevice --with pyyaml -- \
+                python3 "${SCRIPT_DIR}/speak-daemon" \
+                    --model "${model}" --voices "${voices}" ${device_flag[@]+"${device_flag[@]}"} \
+                    2> >(tee -a "${persistent_log}" > "${logfile}")
+            exit_code=$?
+            if [[ ${exit_code} -eq 0 ]]; then
+                echo "=== daemon stopped cleanly $(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" >> "${persistent_log}"
+                break
+            else
+                echo "=== daemon CRASHED exit=${exit_code} $(date -u '+%Y-%m-%dT%H:%M:%SZ') — restarting in 3s ===" >> "${persistent_log}"
+                # Write crash report
+                local crash_dir="${HOME}/.local/share/speak/crashes"
+                mkdir -p "${crash_dir}"
+                local crash_ts
+                crash_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+                local crash_file="${crash_dir}/crash-${crash_ts//[: ]/-}.json"
+                local state_file="/tmp/speak-${USER}.state.json"
+                local events_file="/tmp/speak-${USER}.events.jsonl"
+
+                # Capture last state and last 10 events into crash report
+                python3 - <<PYEOF
+import json, os, sys, time
+
+crash_ts = "${crash_ts}"
+exit_code = ${exit_code}
+state_file = "${state_file}"
+events_file = "${events_file}"
+crash_file = "${crash_file}"
+
+report = {
+    "crashed_at": crash_ts,
+    "exit_code": exit_code,
+    "exit_signal": "SIGSEGV" if exit_code == 139 else ("SIGABRT" if exit_code == 134 else None),
+    "last_state": None,
+    "last_events": [],
+}
+
+try:
+    with open(state_file) as f:
+        report["last_state"] = json.load(f)
+except Exception as e:
+    report["last_state_error"] = str(e)
+
+try:
+    with open(events_file) as f:
+        lines = f.readlines()
+    report["last_events"] = [json.loads(l) for l in lines[-10:] if l.strip()]
+except Exception as e:
+    report["last_events_error"] = str(e)
+
+with open(crash_file, "w") as f:
+    json.dump(report, f, indent=2)
+
+print(f"speak-watchdog: crash report written to {crash_file}", file=sys.stderr)
+PYEOF
+                sleep 3
+            fi
+        done
+    ) &
+    local watchdog_pid=$!
     disown
+    echo "${watchdog_pid}" > "${SOCK_PATH}.watchdog.pid"
 
     # Wait for socket to appear
     local tries=0
@@ -226,6 +300,13 @@ start_daemon() {
 }
 
 stop_daemon() {
+    # Kill watchdog first so it can't restart the daemon after we kill it
+    if [[ -f "${SOCK_PATH}.watchdog.pid" ]]; then
+        local wpid
+        wpid="$(cat "${SOCK_PATH}.watchdog.pid")"
+        kill "${wpid}" 2>/dev/null
+        rm -f "${SOCK_PATH}.watchdog.pid"
+    fi
     if [[ -f "${SOCK_PATH}.pid" ]]; then
         local pid
         pid="$(cat "${SOCK_PATH}.pid")"
@@ -271,7 +352,11 @@ while [[ $# -gt 0 ]]; do
         --replay)     QUEUE_CMD="replay"; shift ;;
         --pause)      QUEUE_CMD="toggle_pause"; shift ;;
         --resume)     QUEUE_CMD="resume"; shift ;;
+        --replay-id)  REPLAY_ID="$2"; shift 2 ;;
+        --clause)     REPLAY_CLAUSE="$2"; shift 2 ;;
+        --play-tone)  PLAY_TONE=true; shift ;;
         --stats)      QUEUE_CMD="stats"; shift ;;
+        --offset)     HISTORY_OFFSET="$2"; shift 2 ;;
         --history)
             HISTORY_N="${2:-10}"; shift
             # Shift again only if $2 was a number (not another flag or end of args)
@@ -468,7 +553,10 @@ sock.sendall(struct.pack('!I', 0))
 raw_len = sock.recv(4)
 if raw_len:
     resp_len = struct.unpack('!I', raw_len)[0]
-    data = sock.recv(resp_len)
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
     resp = json.loads(data)
     released = resp.get('released', [])
     if released:
@@ -483,8 +571,25 @@ sock.close()
             ;;
         --voice-reject)
             _vj_voice="${2:-}"
-            if [[ -z "${_vj_voice}" ]]; then
-                echo "speak: --voice-reject requires VOICE" >&2; exit 1
+            # If a voice name was provided (not another flag), consume it
+            if [[ -n "${_vj_voice}" && "${_vj_voice}" != --* ]]; then
+                shift  # consume the voice arg (exit 0 below ends the loop)
+            else
+                # No voice given — auto-detect from caller's pool assignment
+                _vj_voice=""
+                _auto_detect_caller
+                if [[ -z "${CALLER}" ]]; then
+                    echo "speak: could not detect caller name" >&2; exit 1
+                fi
+                _vj_db="/tmp/speak-${USER}-history.db"
+                if [[ ! -f "${_vj_db}" ]]; then
+                    echo "speak: no history database found" >&2; exit 1
+                fi
+                _vj_voice="$(sqlite3 "${_vj_db}" "SELECT voice FROM history WHERE caller = '${CALLER}' AND voice != '' ORDER BY id DESC LIMIT 1")"
+                if [[ -z "${_vj_voice}" ]]; then
+                    echo "speak: no voice found for caller '${CALLER}'" >&2; exit 1
+                fi
+                echo "speak: detected voice '${_vj_voice}' for caller '${CALLER}'"
             fi
             # Step 1: Set weight to 100 (deprioritize)
             _vj_file="${SCRIPT_DIR}/../config/voices.json"
@@ -507,7 +612,10 @@ sock.sendall(struct.pack('!I', 0))
 raw_len = sock.recv(4)
 if raw_len:
     resp_len = struct.unpack('!I', raw_len)[0]
-    data = sock.recv(resp_len)
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
     resp = json.loads(data)
     released = resp.get('released', [])
     if released:
@@ -519,39 +627,15 @@ sock.close()
             exit 0
             ;;
         --voice-keep)
-            if ! daemon_is_running; then
-                echo "speak: daemon not running (start with: speak --daemon)" >&2
-                exit 1
-            fi
             _auto_detect_caller
             if [[ -z "${CALLER}" ]]; then
                 echo "speak: could not detect caller name" >&2; exit 1
             fi
-            # Query pool status and find this caller's voice
-            _vk_voice="$(python3 -c "
-import socket, struct, json
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'voice_pool_status'}).encode()
-sock.sendall(struct.pack('!I', len(msg)) + msg)
-sock.sendall(struct.pack('!I', 0))
-raw_len = sock.recv(4)
-if raw_len:
-    resp_len = struct.unpack('!I', raw_len)[0]
-    data = sock.recv(resp_len)
-    resp = json.loads(data)
-    caller = '${CALLER}'
-    # Check locks first
-    if caller in resp.get('locks', {}):
-        print(resp['locks'][caller]['voice'])
-    else:
-        # Search claims for this caller
-        for key, val in resp.get('claims', {}).items():
-            if key.startswith(caller + ':'):
-                print(val['voice'])
-                break
-sock.close()
-")"
+            _vk_db="/tmp/speak-${USER}-history.db"
+            if [[ ! -f "${_vk_db}" ]]; then
+                echo "speak: no history database found" >&2; exit 1
+            fi
+            _vk_voice="$(sqlite3 "${_vk_db}" "SELECT voice FROM history WHERE caller = '${CALLER}' AND voice != '' ORDER BY id DESC LIMIT 1")"
             if [[ -z "${_vk_voice}" ]]; then
                 echo "speak: no voice assignment found for caller '${CALLER}'" >&2; exit 1
             fi
@@ -566,6 +650,15 @@ sock.close()
                 && mv "${_vk_tmp}" "${_vk_file}"
             echo "Locked ${CALLER} to ${_vk_voice}"
             exit 0
+            ;;
+        --resume-mid-clause)
+            _rmc_val="${2:-}"
+            if [[ "${_rmc_val}" == "on" || "${_rmc_val}" == "off" ]]; then
+                shift  # consume the on/off value
+            fi
+            QUEUE_CMD="resume_mid_clause"
+            RESUME_MID_CLAUSE_VAL="${_rmc_val}"
+            shift
             ;;
         --rewrites)   python3 "${SCRIPT_DIR}/speak-test-rewrites" "${@:2}"; exit $? ;;
         --mute)       touch "${MUTE_FILE}"; echo "speak: audio mode muted" >&2; exit 0 ;;
@@ -638,7 +731,10 @@ sock.sendall(struct.pack('!I', 0))
 raw_len = sock.recv(4)
 if raw_len:
     resp_len = struct.unpack('!I', raw_len)[0]
-    data = sock.recv(resp_len)
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
     resp = json.loads(data)
     if resp.get('ok'):
         d = resp['device']
@@ -651,28 +747,105 @@ sock.close()
     exit 0
 fi
 
+# --- Handle --replay-id (requires running daemon) ---
+if [[ -n "${REPLAY_ID:-}" ]]; then
+    if ! daemon_is_running; then
+        echo "speak: daemon not running (start with: speak --daemon)" >&2
+        exit 1
+    fi
+    python3 -c "
+import socket, struct, json, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+cmd = {'command': 'replay_by_id', 'id': ${REPLAY_ID}}
+clause = '${REPLAY_CLAUSE:-}'
+if clause:
+    cmd['from_clause'] = int(clause)
+msg = json.dumps(cmd).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
+    resp = json.loads(data)
+    print(json.dumps(resp, indent=2))
+sock.close()
+"
+    exit 0
+fi
+
+# --- Handle --play-tone (play input-received tone for current session) ---
+if [[ -n "${PLAY_TONE:-}" ]]; then
+    if ! daemon_is_running; then
+        echo "speak: daemon not running (start with: speak --daemon)" >&2
+        exit 1
+    fi
+    if [[ -z "${SESSION}" ]]; then
+        SESSION="$(_detect_session)"
+    fi
+    python3 "${SCRIPT_DIR}/speak-client" --play-tone --session "${SESSION}"
+    exit 0
+fi
+
 # --- Handle queue commands (require running daemon) ---
 if [[ -n "${QUEUE_CMD}" ]]; then
     if ! daemon_is_running; then
         echo "speak: daemon not running (start with: speak --daemon)" >&2
         exit 1
     fi
+    if [[ "${QUEUE_CMD}" == "resume_mid_clause" ]]; then
+        python3 -c "
+import socket, struct, json, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect('/tmp/speak-${USER}.sock')
+val = '${RESUME_MID_CLAUSE_VAL:-}'
+cmd = {'command': 'set_resume_mid_clause'}
+if val == 'on':
+    cmd['enabled'] = True
+elif val == 'off':
+    cmd['enabled'] = False
+msg = json.dumps(cmd).encode()
+sock.sendall(struct.pack('!I', len(msg)) + msg)
+sock.sendall(struct.pack('!I', 0))
+raw_len = sock.recv(4)
+if raw_len:
+    resp_len = struct.unpack('!I', raw_len)[0]
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
+    resp = json.loads(data)
+    state = 'on' if resp.get('resume_mid_clause') else 'off'
+    if val:
+        print(f'resume-mid-clause: {state}')
+    else:
+        print(f'resume-mid-clause: {state}')
+sock.close()
+"
+        exit 0
+    fi
     if [[ "${QUEUE_CMD}" == "history" ]]; then
         python3 -c "
 import socket, struct, json, os, sys
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'history', 'n': ${HISTORY_N:-10}}).encode()
+msg = json.dumps({'command': 'history', 'n': ${HISTORY_N:-10}, 'offset': ${HISTORY_OFFSET:-0}}).encode()
 sock.sendall(struct.pack('!I', len(msg)) + msg)
 sock.sendall(struct.pack('!I', 0))
 # Read response
 raw_len = sock.recv(4)
 if raw_len:
     resp_len = struct.unpack('!I', raw_len)[0]
-    data = sock.recv(resp_len)
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
     resp = json.loads(data)
-    entries = resp.get('entries', [])
-    json.dump(entries, sys.stdout, indent=2)
+    json.dump({'entries': resp.get('entries', []), 'total': resp.get('total', 0)}, sys.stdout)
     print()
 sock.close()
 "
@@ -692,16 +865,18 @@ if [[ -n "${CALLER_HISTORY_NAME:-}" ]]; then
 import socket, struct, json, sys
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect('/tmp/speak-${USER}.sock')
-msg = json.dumps({'command': 'caller_history', 'caller': '${CALLER_HISTORY_NAME}', 'n': ${CALLER_HISTORY_N:-10}}).encode()
+msg = json.dumps({'command': 'caller_history', 'caller': '${CALLER_HISTORY_NAME}', 'n': ${CALLER_HISTORY_N:-10}, 'offset': ${HISTORY_OFFSET:-0}}).encode()
 sock.sendall(struct.pack('!I', len(msg)) + msg)
 sock.sendall(struct.pack('!I', 0))
 raw_len = sock.recv(4)
 if raw_len:
     resp_len = struct.unpack('!I', raw_len)[0]
-    data = sock.recv(resp_len)
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
     resp = json.loads(data)
-    entries = resp.get('entries', [])
-    json.dump(entries, sys.stdout, indent=2)
+    json.dump({'entries': resp.get('entries', []), 'total': resp.get('total', 0)}, sys.stdout)
     print()
 sock.close()
 "
@@ -724,7 +899,10 @@ sock.sendall(struct.pack('!I', 0))
 raw_len = sock.recv(4)
 if raw_len:
     resp_len = struct.unpack('!I', raw_len)[0]
-    data = sock.recv(resp_len)
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
     resp = json.loads(data)
     entries = resp.get('entries', [])
     json.dump(entries, sys.stdout, indent=2)
@@ -751,10 +929,13 @@ sock.sendall(struct.pack('!I', 0))
 raw_len = sock.recv(4)
 if raw_len:
     resp_len = struct.unpack('!I', raw_len)[0]
-    data = sock.recv(resp_len)
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
     resp = json.loads(data)
     entries = resp.get('entries', [])
-    print('\n'.join(entries))
+    print('\n'.join(e["text"] for e in entries))
 sock.close()
 ")"
     if [[ -z "${_agent_entries}" ]]; then
@@ -787,11 +968,14 @@ sock.sendall(struct.pack('!I', 0))
 raw_len = sock.recv(4)
 if raw_len:
     resp_len = struct.unpack('!I', raw_len)[0]
-    data = sock.recv(resp_len)
+    data = b''; _rem = resp_len
+    while _rem > 0:
+        _chunk = sock.recv(_rem); data += _chunk; _rem -= len(_chunk)
+        if not _chunk: break
     resp = json.loads(data)
     entries = resp.get('entries', [])
     for entry in entries:
-        print(entry)
+        print(entry["text"])
 sock.close()
 ")"
     if [[ -z "${_agent_lines}" ]]; then
