@@ -16,7 +16,7 @@
  */
 
 import { readHookInput, parseTranscriptFromInput } from './lib/hook-io';
-import { spawnSync } from 'child_process';
+import { spawnSync, spawn } from 'child_process';
 
 const SPEAK = `${process.env.HOME}/code/speak/bin/speak`;
 const SPEAK_SUMMARIZE = `${process.env.HOME}/code/speak/bin/speak-summarize`;
@@ -369,18 +369,23 @@ async function main() {
   const speakable = extractSpeakableText(lastResponse);
   if (!speakable) process.exit(0);
 
-  // Pipe through speak-summarize for pronunciation rewrites, then enqueue
+  // Pipe through speak-summarize for pronunciation rewrites, then enqueue.
+  // This step has no daemon dependency, so a generous timeout is safe.
   const rewritten = spawnSync('python3', [SPEAK_SUMMARIZE], {
     input: speakable,
     encoding: 'utf8',
-    timeout: 5000,
+    timeout: 10000,
   });
   const finalText = rewritten.stdout?.trim() || speakable;
 
-  spawnSync(SPEAK, ['--caller', 'da', finalText], {
-    timeout: 5000,
+  // Fire-and-forget: detach so the hook returns immediately even when the
+  // daemon is cold-starting (model load ~10-15s). No timeout here — bin/speak
+  // now logs any drop to failures.jsonl (task-rc0), so silence stays observable.
+  const child = spawn(SPEAK, ['--caller', 'da', finalText], {
+    detached: true,
     stdio: 'ignore',
   });
+  child.unref();
 
   process.exit(0);
 }
