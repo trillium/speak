@@ -17,7 +17,6 @@ from .playback import PlaybackQueue
 from .protocol import send_json
 from .subscribers import SubscriberManager
 from .synthesis import SynthesisEngine
-from .text import split_clauses
 from .voice_pool import VoicePool
 
 
@@ -86,43 +85,12 @@ class SpeakDaemon:
                 await writer.drain()
                 return
 
-            # --- Original streaming path (unchanged) ---
-            text = request.get("text", "").strip()
-            voice_name = request.get("voice", "af_heart")
-            speed = request.get("speed", 1.0)
-            lang = request.get("lang", "en-us")
-
-            if not text:
-                writer.close()
-                await writer.wait_closed()
-                return
-
-            # Resolve voice style vector once
-            voice = self.kokoro.get_voice_style(voice_name)
-
-            # Split into clauses and stream each one as it's ready
-            clauses = split_clauses(text)
-            loop = asyncio.get_event_loop()
-
-            for sentence in clauses:
-                pcm, needs_upgrade = await loop.run_in_executor(
-                    None, self.synth.synthesize_sentence,
-                    sentence, voice_name, voice, speed, lang,
-                )
-                writer.write(struct.pack("!I", len(pcm)))
-                writer.write(pcm)
-                await writer.drain()
-
-                # If we served from word cache, upgrade to clause cache in background
-                if needs_upgrade:
-                    task = asyncio.create_task(loop.run_in_executor(
-                        None, self.synth.bg_upgrade,
-                        sentence, voice_name, voice, speed, lang,
-                    ))
-                    self._track_bg_task(task)
-
-            # Signal end of stream with zero-length chunk
-            writer.write(struct.pack("!I", 0))
+            # No command and no enqueue flag. The legacy raw-text streaming
+            # path (synthesize clause-by-clause straight to the socket, consumed
+            # by speak-client | ffplay) was retired (task-5p7) — enqueue is now
+            # the only playback route. Reply once with an error and close rather
+            # than leaving the client hanging on a stream that will never come.
+            send_json(writer, {"ok": False, "error": "raw streaming path removed; use enqueue"})
             await writer.drain()
 
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):

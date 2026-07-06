@@ -2,6 +2,12 @@
 
 import re
 
+# Canonical set of clause-splitting punctuation: sentence endings, commas,
+# semicolons, colons, and dashes (hyphen, em-dash, en-dash). The _CLAUSE_RE and
+# _TRAILING_SEP_RE regexes below encode this same set — keep them in sync.
+# test/split_inspect.py imports this rather than redefining it.
+SPLIT_CHARS = frozenset(".!?,;:-—–")
+
 # Split on any natural pause: sentence endings, commas, semicolons, colons, dashes
 _CLAUSE_RE = re.compile(r'(?<=[.!?,;:\u2014\u2013—-])\s+')
 

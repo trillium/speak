@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Connect to speak-daemon, send text, stream raw PCM to stdout."""
+"""Client for speak-daemon: enqueue text, send queue commands, or subscribe.
+
+Modes: --enqueue (queue text for playback), --command/--json (queue commands),
+--subscribe (stream broadcast PCM to stdout), --play-tone. The legacy raw-text
+streaming mode (synth PCM straight back over the socket) was retired (task-5p7).
+"""
 
 import json
 import os
@@ -120,51 +125,36 @@ def main():
         sock.close()
         return
 
-    # --- Enqueue mode ---
-    if args.enqueue:
-        req = {
-            "enqueue": True,
-            "text": text,
-            "voice": args.voice,
-            "speed": args.speed,
-            "lang": args.lang,
-            "session": args.session,
-        }
-        if args.caller:
-            req["caller"] = args.caller
-        _send_request(sock, req)
-        resp = _read_json_response(sock)
+    # --- Enqueue mode (the only text-input mode) ---
+    # The legacy raw PCM streaming mode was retired (task-5p7): the daemon no
+    # longer serves clause-by-clause PCM over the socket, so a text send without
+    # --enqueue has nothing to consume. Require --enqueue explicitly.
+    if not args.enqueue:
+        print(
+            "speak-client: raw streaming mode was removed; pass --enqueue",
+            file=sys.stderr,
+        )
         sock.close()
-        if resp and resp.get("ok"):
-            print(f"queued (position {resp['position']})", file=sys.stderr)
-        elif resp:
-            print(f"speak-client: enqueue failed: {resp}", file=sys.stderr)
-            sys.exit(1)
-        return
+        sys.exit(1)
 
-    # --- Original streaming mode ---
-    _send_request(sock, {
+    req = {
+        "enqueue": True,
         "text": text,
         "voice": args.voice,
         "speed": args.speed,
         "lang": args.lang,
-    })
-
-    # Read length-prefixed PCM chunks and write to stdout
-    while True:
-        raw_len = _recvall(sock, 4)
-        if not raw_len:
-            break
-        chunk_len = struct.unpack("!I", raw_len)[0]
-        if chunk_len == 0:
-            break
-        pcm = _recvall(sock, chunk_len)
-        if not pcm:
-            break
-        sys.stdout.buffer.write(pcm)
-        sys.stdout.buffer.flush()
-
+        "session": args.session,
+    }
+    if args.caller:
+        req["caller"] = args.caller
+    _send_request(sock, req)
+    resp = _read_json_response(sock)
     sock.close()
+    if resp and resp.get("ok"):
+        print(f"queued (position {resp['position']})", file=sys.stderr)
+    elif resp:
+        print(f"speak-client: enqueue failed: {resp}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _recvall(sock, n):

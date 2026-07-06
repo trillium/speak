@@ -82,8 +82,7 @@ Options:
   --daemon          Show daemon status / start it
   --restart         Restart the daemon
   --stop            Stop the daemon
-  --enqueue         Queue text and return immediately (default)
-  --stream          Stream audio via ffplay (blocking, old default)
+  --enqueue         Queue text and return immediately (default, and only mode)
   --queue           Show playback queue status
   --skip            Skip currently playing queued item
   --clear           Clear pending playback queue
@@ -183,7 +182,7 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 
-# ffplay is only needed for non-daemon paths (direct mode, piper, client streaming)
+# ffplay is only needed for non-daemon paths (direct-mode fallback, piper engine)
 _require_ffplay() {
     if ! command -v ffplay >/dev/null 2>&1; then
         echo "speak: this mode requires ffplay (install ffmpeg)" >&2
@@ -391,7 +390,6 @@ restart_daemon() {
 LIST_VOICES=false
 LIST_DEVICES=false
 DAEMON_CMD=""
-ENQUEUE="${SPEAK_ENQUEUE:-true}"
 QUEUE_CMD=""
 TEXT_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -409,8 +407,7 @@ while [[ $# -gt 0 ]]; do
         --restart)    DAEMON_CMD="restart"; shift ;;
         --stop)       DAEMON_CMD="stop"; shift ;;
         --caller)     CALLER="$2"; shift 2 ;;
-        --enqueue)    ENQUEUE=true; shift ;;
-        --stream)     ENQUEUE=false; shift ;;
+        --enqueue)    shift ;;  # accepted for compatibility; enqueue is the only playback mode
         --queue)      QUEUE_CMD="queue_status"; shift ;;
         --skip)       QUEUE_CMD="skip"; shift ;;
         --clear)      QUEUE_CMD="clear"; shift ;;
@@ -929,6 +926,18 @@ fi
 # Kokoro engine (daemon-backed)
 # =============================================================================
 speak_kokoro() {
+    # --save writes a WAV via the kokoro-tts CLI directly (proper WAV headers)
+    # and needs no daemon — handle it before the daemon path.
+    if [[ -n "${SAVE_FILE}" ]]; then
+        local model="${KOKORO_DIR}/kokoro-v1.0.onnx"
+        local voices="${KOKORO_DIR}/voices-v1.0.bin"
+        printf '%s' "${TEXT}" | uv run --python 3.14 --with kokoro-tts -- kokoro-tts - "${SAVE_FILE}" \
+            --voice "${VOICE}" --speed "${SPEED}" \
+            --model "${model}" --voices "${voices}" 2>&1 | grep -v "^Consider"
+        echo "speak: saved to ${SAVE_FILE}" >&2
+        return
+    fi
+
     # Auto-start daemon if not running
     if ! daemon_is_running; then
         start_daemon || {
@@ -938,74 +947,59 @@ speak_kokoro() {
         }
     fi
 
-    if [[ "${ENQUEUE}" == true ]]; then
-        # Auto-detect caller if not explicitly set
-        _auto_detect_caller
+    # Enqueue — the only playback mode (the legacy --stream/ffplay path was retired).
+    # Auto-detect caller if not explicitly set
+    _auto_detect_caller
 
-        # Detect session (Claude Code ancestor PID or PPID fallback)
-        if [[ -z "${SESSION}" ]]; then
-            SESSION="$(_detect_session)"
-        fi
-
-        # Resolve backend: auto picks fastest available
-        local backend="${ENQUEUE_BACKEND}"
-        if [[ "${backend}" == "auto" ]]; then
-            if [[ -x "${SCRIPT_DIR}/speak-enqueue" ]]; then
-                backend="c"
-            else
-                backend="python"
-            fi
-        fi
-
-        local _ec=0
-        case "${backend}" in
-            c)
-                local caller_flag=()
-                if [[ -n "${CALLER}" ]]; then
-                    caller_flag=(-c "${CALLER}")
-                fi
-                # `|| _ec=$?` keeps set -e from aborting AND captures the real
-                # pipeline exit code (pipefail => backend's code) for the log.
-                printf '%s' "${TEXT}" | "${SCRIPT_DIR}/speak-enqueue" \
-                    -v "${VOICE}" -s "${SPEED}" -S "${SESSION}" "${caller_flag[@]}" || _ec=$?
-                if [[ ${_ec} -ne 0 ]]; then
-                    _log_failure "enqueue_c" "${_ec}" "${TEXT}"
-                    exit "${_ec}"
-                fi
-                ;;
-            python)
-                local caller_flag=()
-                if [[ -n "${CALLER}" ]]; then
-                    caller_flag=(--caller "${CALLER}")
-                fi
-                printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
-                    --enqueue --voice "${VOICE}" --speed "${SPEED}" \
-                    --session "${SESSION}" "${caller_flag[@]}" || _ec=$?
-                if [[ ${_ec} -ne 0 ]]; then
-                    _log_failure "enqueue_python" "${_ec}" "${TEXT}"
-                    exit "${_ec}"
-                fi
-                ;;
-            *)
-                echo "speak: unknown enqueue backend '${backend}' (use c or python)" >&2
-                exit 1
-                ;;
-        esac
-    elif [[ -n "${SAVE_FILE}" ]]; then
-        # For --save, use kokoro-tts CLI directly (produces proper WAV headers)
-        local model="${KOKORO_DIR}/kokoro-v1.0.onnx"
-        local voices="${KOKORO_DIR}/voices-v1.0.bin"
-        printf '%s' "${TEXT}" | uv run --python 3.14 --with kokoro-tts -- kokoro-tts - "${SAVE_FILE}" \
-            --voice "${VOICE}" --speed "${SPEED}" \
-            --model "${model}" --voices "${voices}" 2>&1 | grep -v "^Consider"
-        echo "speak: saved to ${SAVE_FILE}" >&2
-    else
-        # Stream via daemon -> speak-client -> ffplay
-        _require_ffplay
-        printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
-                --voice "${VOICE}" --speed "${SPEED}" \
-        | ffplay -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -i pipe:0 -loglevel quiet
+    # Detect session (Claude Code ancestor PID or PPID fallback)
+    if [[ -z "${SESSION}" ]]; then
+        SESSION="$(_detect_session)"
     fi
+
+    # Resolve backend: auto picks fastest available
+    local backend="${ENQUEUE_BACKEND}"
+    if [[ "${backend}" == "auto" ]]; then
+        if [[ -x "${SCRIPT_DIR}/speak-enqueue" ]]; then
+            backend="c"
+        else
+            backend="python"
+        fi
+    fi
+
+    local _ec=0
+    case "${backend}" in
+        c)
+            local caller_flag=()
+            if [[ -n "${CALLER}" ]]; then
+                caller_flag=(-c "${CALLER}")
+            fi
+            # `|| _ec=$?` keeps set -e from aborting AND captures the real
+            # pipeline exit code (pipefail => backend's code) for the log.
+            printf '%s' "${TEXT}" | "${SCRIPT_DIR}/speak-enqueue" \
+                -v "${VOICE}" -s "${SPEED}" -S "${SESSION}" "${caller_flag[@]}" || _ec=$?
+            if [[ ${_ec} -ne 0 ]]; then
+                _log_failure "enqueue_c" "${_ec}" "${TEXT}"
+                exit "${_ec}"
+            fi
+            ;;
+        python)
+            local caller_flag=()
+            if [[ -n "${CALLER}" ]]; then
+                caller_flag=(--caller "${CALLER}")
+            fi
+            printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
+                --enqueue --voice "${VOICE}" --speed "${SPEED}" \
+                --session "${SESSION}" "${caller_flag[@]}" || _ec=$?
+            if [[ ${_ec} -ne 0 ]]; then
+                _log_failure "enqueue_python" "${_ec}" "${TEXT}"
+                exit "${_ec}"
+            fi
+            ;;
+        *)
+            echo "speak: unknown enqueue backend '${backend}' (use c or python)" >&2
+            exit 1
+            ;;
+    esac
 }
 
 # Fallback: direct mode without daemon (cold start each time)

@@ -29,7 +29,13 @@ from .text import split_clauses
 # are always logged.
 DEBUG_TIMING = os.environ.get("SPEAK_DEBUG_TIMING") == "1"
 
-# Silence detection threshold: fraction of peak amplitude
+# Clause-edge silence trim threshold: fraction of peak *amplitude* (see
+# _find_voice_bounds). Intentionally far more sensitive than config's
+# SILENCE_THRESHOLD (0.02) — this trims the leading/trailing near-silence off a
+# single synthesized clause before re-padding it with punctuation gaps, so it
+# must catch very quiet clause edges (compared against peak amplitude, not
+# frame energy). config.SILENCE_THRESHOLD is coarse because it segments words
+# mid-utterance where voiced tails must not be mistaken for gaps.
 _SILENCE_THRESH = 0.001
 
 _TRIM_CONFIG_PATH = os.path.join(

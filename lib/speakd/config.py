@@ -28,6 +28,12 @@ SILENCE_GAP_MS = 30       # silence inserted between assembled words
 CROSSFADE_SAMPLES = int(SAMPLE_RATE * CROSSFADE_MS / 1000)
 SILENCE_SAMPLES = int(SAMPLE_RATE * SILENCE_GAP_MS / 1000)
 
-# Energy threshold for silence detection (relative to peak)
+# Energy threshold for word-boundary detection during word-audio assembly,
+# as a fraction of peak frame energy (see audio.py detect_word_boundaries:
+# `energy < peak_energy * SILENCE_THRESHOLD`). Deliberately coarse (0.02):
+# it splits assembled words at inter-word gaps, so it must ignore the
+# low-amplitude tails of voiced speech and only fire on real silence.
+# Distinct from renderer._SILENCE_THRESH (0.001), which trims clause edges and
+# is far more sensitive on purpose — see the note there.
 SILENCE_THRESHOLD = 0.02
 SILENCE_MIN_SAMPLES = int(SAMPLE_RATE * 0.02)  # 20ms minimum gap to count as word boundary
