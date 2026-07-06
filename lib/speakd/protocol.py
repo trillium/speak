@@ -26,8 +26,30 @@ def send_json(writer, obj: dict) -> None:
     writer.write(struct.pack("!I", 0))
 
 
+# publish_state is called on every queue event with a full-state disk write.
+# To kill write bursts (e.g. rapid consecutive "enqueued" events) we skip the
+# disk write when it would land within _THROTTLE_SECS of the previous write AND
+# carries the same event kind. Any change of event kind — the transitions that
+# matter (enqueued/playing/item_done/idle) — always writes immediately. The
+# subscriber broadcast in PlaybackQueue._publish is separate and stays
+# unthrottled.
+_THROTTLE_SECS = 0.1
+_last_write_monotonic = 0.0
+_last_event: str | None = None
+
+
 def publish_state(state: dict) -> None:
-    """Write current state to a JSON file for external tools to monitor."""
+    """Write current state to a JSON file for external tools to monitor.
+
+    Throttled: bursts of same-kind events within _THROTTLE_SECS collapse to one
+    write; a different event kind always writes.
+    """
+    global _last_write_monotonic, _last_event
+    event = state.get("event")
+    now = time.monotonic()
+    if event == _last_event and (now - _last_write_monotonic) < _THROTTLE_SECS:
+        return
+
     state["timestamp"] = time.time()
     tmp = STATE_PATH + ".tmp"
     try:
@@ -35,7 +57,9 @@ def publish_state(state: dict) -> None:
             json.dump(state, f)
         os.replace(tmp, STATE_PATH)
     except OSError:
-        pass
+        return
+    _last_write_monotonic = now
+    _last_event = event
 
 
 def log_event(event: str, **data) -> None:

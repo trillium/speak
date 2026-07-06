@@ -83,6 +83,21 @@ def _find_voice_bounds(audio):
     return int(above[0]), int(above[-1]) + 1
 
 
+def audio_to_pcm(audio, gain: float = 1.0) -> bytes:
+    """Convert float32 [-1.0, 1.0] audio to 16-bit little-endian PCM bytes.
+
+    Gain is applied to the float samples BEFORE int16 quantization so there is
+    a single rounding step. The old path quantized to int16, cast back to
+    float32, multiplied by gain, then re-quantized — double-rounding that this
+    replaces. Samples are clipped to the int16 range.
+    """
+    samples = audio
+    if gain != 1.0:
+        samples = samples * gain
+    pcm = np.clip(samples * 32767.0, -32768.0, 32767.0).astype(np.int16)
+    return pcm.tobytes()
+
+
 def trim_clause_audio(audio, split_char, prev_split_char, is_first):
     """Strip silence from audio and add punctuation-appropriate padding.
 
@@ -256,18 +271,11 @@ async def render_speech(
     prev_split_char = None  # tracks previous clause's ending punctuation
 
     async def _play_audio(audio):
-        """Convert float32 audio to PCM and write to device."""
+        """Convert float32 audio to PCM (gain applied pre-quantization) and write."""
         nonlocal total_audio_secs, chunks_done, chunk_idx
 
-        pcm_samples = (audio * 32767).astype(np.int16)
-
-        if gain != 1.0:
-            pcm_samples = np.clip(
-                pcm_samples.astype(np.float32) * gain, -32767, 32767
-            ).astype(np.int16)
-
-        pcm = pcm_samples.tobytes()
-        dur = len(pcm_samples) / SAMPLE_RATE
+        pcm = audio_to_pcm(audio, gain)
+        dur = (len(pcm) // 2) / SAMPLE_RATE
 
         log_event("chunk_ready", qid=qid, chunk=chunk_idx + 1,
                   audio_secs=round(dur, 2), audio_bytes=len(pcm))

@@ -19,7 +19,7 @@ from .config import DEFAULT_SPEED
 from .playback_device import AudioOutputStream
 from .history import SpeechHistory
 from .protocol import publish_state
-from .renderer import prefetch_first_chunk, render_speech
+from .renderer import audio_to_pcm, prefetch_first_chunk, render_speech
 from .synthesis import SynthesisEngine
 from .tones import (
     CALLER_GAP,
@@ -441,18 +441,11 @@ class PlaybackQueue:
                 # Announce new voice assignment
                 t_announce_start = _ts()
                 if is_new_claim and caller:
-                    import numpy as np
                     announce_text = f"{caller} here"
                     async for audio, sr in self.synth.kokoro.create_stream(
                         announce_text, voice_name, DEFAULT_SPEED, "en-us", trim=False
                     ):
-                        audio = audio.squeeze()
-                        pcm_samples = (audio * 32767).astype(np.int16)
-                        if gain != 1.0:
-                            pcm_samples = np.clip(
-                                pcm_samples.astype(np.float32) * gain, -32767, 32767
-                            ).astype(np.int16)
-                        await self._audio.write_pcm(pcm_samples.tobytes())
+                        await self._audio.write_pcm(audio_to_pcm(audio.squeeze(), gain))
                 t_announce_done = _ts()
 
                 t_publish_start = _ts()

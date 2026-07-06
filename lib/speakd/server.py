@@ -29,6 +29,7 @@ class SpeakDaemon:
         self.last_activity = time.monotonic()
         self.active_connections = 0
         self._bg_tasks: set[asyncio.Future] = set()
+        self._shutdown: asyncio.Event | None = None
         self.start_time = time.time()
         config_dir = os.path.join(os.path.dirname(__file__), "..", "..", "config")
         voice_config = os.path.join(config_dir, "voices.json")
@@ -154,7 +155,8 @@ class SpeakDaemon:
                 non_subscriber_conns = self.active_connections - self.subscriber_manager.count
                 if non_subscriber_conns <= 0 and idle_for >= IDLE_TIMEOUT and not self.playback_queue.is_active:
                     print(f"speak-daemon: idle for {IDLE_TIMEOUT}s, shutting down", file=sys.stderr)
-                    cleanup_and_exit()
+                    self._shutdown.set()
+                    return
             if time.monotonic() - last_evict > evict_interval:
                 removed = self.cache.evict_expired()
                 if removed:
@@ -173,6 +175,16 @@ class SpeakDaemon:
             "session": "",
         }, priority=True)
 
+    def _request_shutdown(self, sig=None):
+        """Signal the run loop to begin a graceful shutdown (idempotent)."""
+        if sig is not None:
+            print(
+                f"speak-daemon: received {signal.Signals(sig).name}, shutting down",
+                file=sys.stderr,
+            )
+        if self._shutdown is not None:
+            self._shutdown.set()
+
     async def run(self):
         # Clean up stale socket
         if os.path.exists(SOCKET_PATH):
@@ -186,6 +198,16 @@ class SpeakDaemon:
         with open(pid_path, "w") as f:
             f.write(str(os.getpid()))
 
+        # Graceful shutdown coordination: SIGTERM/SIGINT and the unsupervised
+        # idle watchdog all set this event. add_signal_handler keeps signal
+        # delivery on the event loop (no sys.exit from a handler mid-coroutine),
+        # and the finally block unlinks the socket/pid exactly once. Returning
+        # normally keeps the process exit code at 0 for launchd bootout.
+        self._shutdown = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, self._request_shutdown, sig)
+
         s = self.cache.stats()
         print(
             f"speak-daemon: listening on {SOCKET_PATH} (pid {os.getpid()})\n"
@@ -197,11 +219,14 @@ class SpeakDaemon:
         self.playback_queue.start()
         asyncio.create_task(self.idle_watchdog())
 
-        # Announce startup — schedule as task so server.serve_forever() starts first
+        # Announce startup — schedule as task so the server is serving first.
         asyncio.create_task(self._startup_announce())
 
-        async with server:
-            await server.serve_forever()
+        try:
+            async with server:
+                await self._shutdown.wait()
+        finally:
+            _cleanup_files()
 
 
 # ---------------------------------------------------------------------------
@@ -428,16 +453,13 @@ COMMANDS = {
 }
 
 
-def cleanup_and_exit():
-    try:
-        os.unlink(SOCKET_PATH)
-    except FileNotFoundError:
-        pass
-    try:
-        os.unlink(SOCKET_PATH + ".pid")
-    except FileNotFoundError:
-        pass
-    sys.exit(0)
+def _cleanup_files():
+    """Unlink the socket and pid file. Best-effort; safe to call once on exit."""
+    for path in (SOCKET_PATH, SOCKET_PATH + ".pid"):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 def main():
@@ -473,9 +495,10 @@ def main():
             print(f"speak-daemon: resolved device '{device}' -> index {matched} ({devices[matched]['name']})", file=sys.stderr)
             device = matched
 
-    # Handle signals for clean shutdown
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: cleanup_and_exit())
+    # Signal handling for clean shutdown is installed inside run() via
+    # loop.add_signal_handler once the event loop exists. Before the loop
+    # starts (during model load) there is no socket/pid to clean, so the
+    # default SIGTERM disposition is safe.
 
     print("speak-daemon: loading model...", file=sys.stderr)
     daemon = SpeakDaemon(args.model, args.voices, device=device)
