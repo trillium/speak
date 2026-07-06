@@ -41,23 +41,24 @@ The daemon starts automatically on first use. It shuts down after 5 minutes of i
 
 ## Playback modes
 
-### Sync (default)
+### Queue (fire-and-forget) — the only mode
 
-Blocks until playback finishes. Audio streams from the daemon to the client, which pipes it to `ffplay`.
-
-```bash
-speak "This blocks until done."
-```
-
-### Queue (fire-and-forget)
-
-Returns immediately. The daemon synthesizes and plays items sequentially through a persistent `ffplay` process. No overlap — items play one at a time in FIFO order. PCM audio is written in small chunks with backpressure-based pacing for gapless playback.
+Every `speak` invocation enqueues and returns immediately; `--enqueue` is the
+default (and accepted explicitly for compatibility). The daemon synthesizes and
+plays items sequentially through a persistent audio stream. No overlap — items
+play one at a time in FIFO order, with backpressure-based pacing for gapless
+playback.
 
 ```bash
-speak --enqueue "First thing to say"
-speak --enqueue "Second thing to say"   # returns instantly, plays after first
-echo "summary of results" | speak --enqueue
+speak "First thing to say"              # enqueues and returns
+speak --enqueue "Second thing to say"   # same; plays after the first
+echo "summary of results" | speak
 ```
+
+> The legacy synchronous `--stream` mode (blocking playback piped straight to
+> `ffplay`) was retired. `--save` still writes a WAV directly, and the
+> daemon-less `speak_kokoro_direct` fallback + the piper engine still use
+> `ffplay`.
 
 Manage the queue:
 
@@ -255,15 +256,21 @@ The daemon logs to `/tmp/speak-$USER.sock.log`. Queued items produce per-clause 
 - **audio** = seconds of audio produced
 - **speed** = speed value used
 
+## Repo layout notes
+
+A few directories in this repo are not part of the TTS system itself:
+
+- **`witness/`** and **`mayor/rig/`** — embedded agent-workspace directories with
+  their own `.claude` setups. Tooling scratch, not shipped code.
+- **`refinery/`** — scratch space for the pronunciation-rewrites pipeline.
+- **`launchd/`** — holds the daemon plist (`com.speak.daemon.plist`), which
+  `bin/speak` installs to `~/Library/LaunchAgents` on first daemon start.
+- **`bin/sleep`** — a local build artifact compiled from `bin/sleep.ts`
+  (gitignored; rebuilt on demand).
+
 ## Socket protocol
 
 Length-prefixed messages over Unix socket. Each message is `[4-byte big-endian length][payload]`. A zero-length message signals end of stream.
-
-**Sync request:**
-```json
-{"text": "hello", "voice": "af_heart", "speed": 1.0, "lang": "en-us"}
-```
-Response: sequence of length-prefixed PCM chunks, terminated by zero-length chunk.
 
 **Enqueue request:**
 ```json

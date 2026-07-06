@@ -32,6 +32,11 @@ redirect
 # These files are machine-specific and should not be shared across clones
 .sync.lock
 export-state/
+export-state.json
+
+# Gas Town / bd runtime markers (local-only, per-machine) — task-63r
+.beads-credential-key
+.gt-types-configured
 
 # Ephemeral store (SQLite - wisps/molecules, intentionally not versioned)
 ephemeral.sqlite3

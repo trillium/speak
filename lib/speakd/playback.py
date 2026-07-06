@@ -128,6 +128,10 @@ class PlaybackQueue:
     def last_voice_for_caller(self, caller: str) -> str | None:
         return self._history.last_voice_for_caller(caller)
 
+    def close_history(self) -> None:
+        """Close the history DB connection. Called on daemon shutdown."""
+        self._history.close()
+
     async def play_raw_pcm(self, pcm: bytes) -> None:
         """Write raw PCM bytes straight to the audio device (used for tones)."""
         await self._audio.write_pcm(pcm)

@@ -62,8 +62,26 @@ def publish_state(state: dict) -> None:
     _last_event = event
 
 
+# Event log rotation: the JSONL log in /tmp otherwise grows unbounded. Every
+# _EVENT_LOG_ROTATE_CHECK_EVERY calls we stat the file and, if it exceeds
+# _EVENT_LOG_MAX_BYTES, rotate it to .1 before appending. The stat is throttled
+# so the common path stays a single append with no extra syscall.
+_EVENT_LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+_EVENT_LOG_ROTATE_CHECK_EVERY = 1000
+_event_log_calls = 0
+
+
 def log_event(event: str, **data) -> None:
-    """Append a structured JSONL event to the event log."""
+    """Append a structured JSONL event to the event log (rotates past 10 MB)."""
+    global _event_log_calls
+    _event_log_calls += 1
+    if _event_log_calls % _EVENT_LOG_ROTATE_CHECK_EVERY == 0:
+        try:
+            if os.path.getsize(EVENT_LOG_PATH) > _EVENT_LOG_MAX_BYTES:
+                os.replace(EVENT_LOG_PATH, EVENT_LOG_PATH + ".1")
+        except OSError:
+            pass
+
     entry = {"ts": time.monotonic(), "wall": time.time(), "event": event}
     entry.update(data)
     try:

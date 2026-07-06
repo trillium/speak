@@ -7,3 +7,9 @@
 .runtime/
 .claude/commands/
 .logs/
+
+# Build artifacts and runtime junk (task-63r)
+# bin/sleep is a 61MB compiled bun binary; source bin/sleep.ts is built on demand
+bin/sleep
+__pycache__/
+state.json

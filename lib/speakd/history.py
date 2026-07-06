@@ -108,3 +108,10 @@ class SpeechHistory:
             (caller,),
         ).fetchone()
         return row[0] if row else None
+
+    def close(self) -> None:
+        """Close the SQLite connection. Safe to call more than once."""
+        try:
+            self._db.close()
+        except sqlite3.Error:
+            pass

@@ -194,6 +194,10 @@ class SpeakDaemon:
             async with server:
                 await self._shutdown.wait()
         finally:
+            # Graceful shutdown: close the history DB connection, then unlink the
+            # socket/pid files. close_history() swallows its own errors so a bad
+            # close never blocks socket cleanup.
+            self.playback_queue.close_history()
             _cleanup_files()
 
 
