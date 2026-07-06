@@ -23,6 +23,11 @@ from .playback_device import AudioOutputStream
 from .protocol import log_event
 from .text import split_clauses
 
+# Per-chunk and prefetch timing prints are off by default; set
+# SPEAK_DEBUG_TIMING=1 to emit them. The single per-request START/DONE lines
+# are always logged.
+DEBUG_TIMING = os.environ.get("SPEAK_DEBUG_TIMING") == "1"
+
 # Silence detection threshold: fraction of peak amplitude
 _SILENCE_THRESH = 0.001
 
@@ -153,11 +158,12 @@ async def prefetch_first_chunk(synth, text, voice_name, speed, lang):
     first_clause = clauses[0]
     remaining = clauses[1:]
 
-    print(
-        f"speak-daemon: prefetch_first_chunk STARTED voice={voice_name} "
-        f"clauses={len(clauses)} first=\"{first_clause[:40]}\"",
-        file=sys.stderr,
-    )
+    if DEBUG_TIMING:
+        print(
+            f"speak-daemon: prefetch_first_chunk STARTED voice={voice_name} "
+            f"clauses={len(clauses)} first=\"{first_clause[:40]}\"",
+            file=sys.stderr,
+        )
 
     first_chunks = []
     async for audio, sr in synth.kokoro.create_stream(
@@ -165,12 +171,13 @@ async def prefetch_first_chunk(synth, text, voice_name, speed, lang):
     ):
         first_chunks.append((audio, sr))
 
-    elapsed_ms = (time.monotonic() - t0) * 1000
-    print(
-        f"speak-daemon: prefetch_first_chunk DONE {elapsed_ms:.0f}ms "
-        f"chunks={len(first_chunks)} remaining_clauses={len(remaining)}",
-        file=sys.stderr,
-    )
+    if DEBUG_TIMING:
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        print(
+            f"speak-daemon: prefetch_first_chunk DONE {elapsed_ms:.0f}ms "
+            f"chunks={len(first_chunks)} remaining_clauses={len(remaining)}",
+            file=sys.stderr,
+        )
     return first_chunks, remaining
 
 
@@ -254,11 +261,12 @@ async def render_speech(
         chunks_done += 1
         chunk_idx += 1
 
-        print(
-            f"speak-daemon: [q#{qid}]   chunk {chunk_idx} "
-            f"audio={dur:.2f}s",
-            file=sys.stderr,
-        )
+        if DEBUG_TIMING:
+            print(
+                f"speak-daemon: [q#{qid}]   chunk {chunk_idx} "
+                f"audio={dur:.2f}s",
+                file=sys.stderr,
+            )
 
     def _get_split_char(clause):
         """Get the trailing punctuation from a clause."""
