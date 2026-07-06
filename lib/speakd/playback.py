@@ -1,11 +1,11 @@
-"""Playback queue: FIFO queue for fire-and-forget TTS with persistent ffplay.
+"""Playback queue: FIFO queue for fire-and-forget TTS over a live audio stream.
 
-One ffplay process stays open for the lifetime of the queue, receiving a
-continuous PCM stream. Items flow seamlessly with no gaps. The worker uses
-time-based tracking to know when each item's audio has finished playing,
-keeping queue status accurate.
+A single AudioOutputStream (sounddevice/PortAudio) stays open for the lifetime
+of the queue, receiving a continuous PCM stream. Items flow seamlessly with no
+gaps. The worker uses time-based tracking to know when each item's audio has
+finished playing, keeping queue status accurate.
 
-Skip kills the ffplay process (next write auto-restarts it).
+Skip aborts the audio stream (the next write reopens it automatically).
 """
 
 import asyncio
@@ -52,7 +52,7 @@ class PlaybackQueue:
         self._subscriber_manager = subscriber_manager
         self._queue: asyncio.Queue = asyncio.Queue()
         self._current: dict | None = None
-        self._ffplay = AudioOutputStream(subscriber_manager=subscriber_manager, device=device)
+        self._audio = AudioOutputStream(subscriber_manager=subscriber_manager, device=device)
         self._worker_task: asyncio.Task | None = None
         self._id_counter = 0
         self._skip_flag = False
@@ -76,17 +76,61 @@ class PlaybackQueue:
     def update_history_voice(self, row_id: int, voice: str):
         self._history.update_voice(row_id, voice)
 
-    def get_history(self, n: int = 10) -> list[str]:
-        return self._history.get(n)
+    # --- Public queue introspection (no underscore reach-through for callers) ---
 
-    def get_history_by_session(self, session: str, n: int = 10) -> list[str]:
-        return self._history.get_by_session(session, n)
+    def pending_count(self) -> int:
+        """Number of items waiting in the queue (excludes the item playing)."""
+        return self._queue.qsize()
 
-    def get_history_by_caller(self, caller: str, n: int = 10) -> list[str]:
-        return self._history.get_by_caller(caller, n)
+    def current_summary(self) -> str | None:
+        """Truncated text of the item currently playing, or None when idle."""
+        if self._current is None:
+            return None
+        return self._current.get("text", "")[:80]
 
-    def get_history_by_id(self, row_id: int) -> dict | None:
+    def current_broadcast(self) -> dict | None:
+        """Metadata for the currently playing item, shaped for subscriber events.
+
+        Returns {id, caller, voice, text} or None when nothing is playing.
+        """
+        if self._current is None:
+            return None
+        return {
+            "id": self._current.get("_queue_id"),
+            "caller": self._current.get("caller", ""),
+            "voice": self._current.get("_resolved_voice", ""),
+            "text": self._current.get("text", "")[:120],
+        }
+
+    @property
+    def resume_mid_clause(self) -> bool:
+        """Whether a paused item resumes from its interrupted clause vs. the start."""
+        return self._resume_mid_clause
+
+    @resume_mid_clause.setter
+    def resume_mid_clause(self, enabled: bool) -> None:
+        self._resume_mid_clause = bool(enabled)
+
+    # --- Public history delegation (server never touches self._history directly) ---
+
+    def history_get(self, n: int = 10, offset: int = 0) -> tuple[list[dict], int]:
+        return self._history.get(n, offset)
+
+    def history_by_session(self, session: str, n: int = 10, offset: int = 0) -> tuple[list[dict], int]:
+        return self._history.get_by_session(session, n, offset)
+
+    def history_by_caller(self, caller: str, n: int = 10, offset: int = 0) -> tuple[list[dict], int]:
+        return self._history.get_by_caller(caller, n, offset)
+
+    def history_by_id(self, row_id: int) -> dict | None:
         return self._history.get_by_id(row_id)
+
+    def last_voice_for_caller(self, caller: str) -> str | None:
+        return self._history.last_voice_for_caller(caller)
+
+    async def play_raw_pcm(self, pcm: bytes) -> None:
+        """Write raw PCM bytes straight to the audio device (used for tones)."""
+        await self._audio.write_pcm(pcm)
 
     async def replay_by_id(self, row_id: int, from_clause: int | None = None) -> dict:
         """Replay a history entry by ID using its original voice.
@@ -118,7 +162,7 @@ class PlaybackQueue:
 
     async def set_device(self, device):
         """Switch audio output device at runtime."""
-        await self._ffplay.set_device(device)
+        await self._audio.set_device(device)
 
     def start(self):
         self._worker_task = asyncio.create_task(self._worker())
@@ -156,7 +200,7 @@ class PlaybackQueue:
         # If something is currently playing, stop it (will be stashed in finally block)
         if self._current:
             self._skip_flag = True
-            await self._ffplay.kill(force=True)
+            await self._audio.kill(force=True)
         self._publish("paused")
         return {"ok": True}
 
@@ -176,7 +220,7 @@ class PlaybackQueue:
         return await self.pause()
 
     async def skip(self) -> dict:
-        """Skip current item by killing ffplay. Next write restarts it.
+        """Skip current item by aborting the audio stream. Next write reopens it.
 
         While paused: discards the stashed replay item but stays paused.
         """
@@ -189,7 +233,7 @@ class PlaybackQueue:
         if self._current:
             self._skip_flag = True
             self.total_skipped += 1
-            await self._ffplay.kill(force=True)
+            await self._audio.kill(force=True)
             self._publish("skipped")
             return {"ok": True, "skipped": self._current.get("text", "")[:80]}
         return {"ok": False, "error": "nothing playing"}
@@ -321,9 +365,9 @@ class PlaybackQueue:
                     if caller and caller != self._last_caller:
                         # Gap after previous caller's end tone
                         print(f"speak-daemon: [gap] 1.0s silence between {self._last_caller} -> {caller}", file=sys.stderr)
-                        await self._ffplay.write_pcm(CALLER_GAP)
+                        await self._audio.write_pcm(CALLER_GAP)
                     elif not caller or caller == self._last_caller:
-                        await self._ffplay.write_pcm(SEPARATOR_TONE)
+                        await self._audio.write_pcm(SEPARATOR_TONE)
 
                 # Resolve voice via pool (caller+session) or use request default
                 voice_name = request.get("voice", "af_heart")
@@ -391,7 +435,7 @@ class PlaybackQueue:
                 # Start tone
                 t_tone_start = _ts()
                 if caller:
-                    await self._ffplay.write_pcm(get_caller_tone(caller))
+                    await self._audio.write_pcm(get_caller_tone(caller))
                 t_tone_done = _ts()
 
                 # Announce new voice assignment
@@ -408,7 +452,7 @@ class PlaybackQueue:
                             pcm_samples = np.clip(
                                 pcm_samples.astype(np.float32) * gain, -32767, 32767
                             ).astype(np.int16)
-                        await self._ffplay.write_pcm(pcm_samples.tobytes())
+                        await self._audio.write_pcm(pcm_samples.tobytes())
                 t_announce_done = _ts()
 
                 t_publish_start = _ts()
@@ -433,7 +477,7 @@ class PlaybackQueue:
 
                 # The actual speech (uses prefetched first chunk if available)
                 chunks_done = await render_speech(
-                    request, loop, self.synth, self._ffplay,
+                    request, loop, self.synth, self._audio,
                     skip_flag_fn=lambda: self._skip_flag,
                     bg_task_tracker=self._bg_task_tracker,
                     prefetch=prefetch,
@@ -466,7 +510,7 @@ class PlaybackQueue:
 
                 # End tone
                 if caller:
-                    await self._ffplay.write_pcm(get_caller_tone(caller))
+                    await self._audio.write_pcm(get_caller_tone(caller))
 
                 self._publish("item_done")
                 self._last_request = request
@@ -493,10 +537,10 @@ class PlaybackQueue:
 
                 self._current = None
                 self._on_activity()
-                # Reset separator counter when queue drains, and kill ffplay
-                # so next batch gets a fresh audio device (handles device changes)
+                # Reset separator counter when queue drains, and stop the audio
+                # stream so the next batch gets a fresh device (handles device changes)
                 if self._queue.empty() and not self._paused:
                     self._items_played = 0
-                    await self._ffplay.kill()
+                    await self._audio.kill()
                     self._publish("idle")
 

@@ -132,7 +132,7 @@ def _split_sys_segments(text: str) -> list[tuple[str, str]]:
 
 async def _play_sys_clip(
     slug: str,
-    ffplay: AudioOutputStream,
+    audio_stream: AudioOutputStream,
     skip_flag_fn,
     gain: float,
 ) -> bool:
@@ -145,7 +145,7 @@ async def _play_sys_clip(
         samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
         samples = np.clip(samples * gain, -32767, 32767).astype(np.int16)
         pcm = samples.tobytes()
-    await ffplay.write_pcm(pcm, skip_flag_fn=skip_flag_fn)
+    await audio_stream.write_pcm(pcm, skip_flag_fn=skip_flag_fn)
     return True
 
 
@@ -205,7 +205,7 @@ async def render_speech(
     request: dict,
     loop: asyncio.AbstractEventLoop,
     synth,
-    ffplay: AudioOutputStream,
+    audio_stream: AudioOutputStream,
     skip_flag_fn,
     bg_task_tracker,
     prefetch=None,
@@ -275,7 +275,7 @@ async def render_speech(
         if chunk_idx == 0 and on_first_write is not None:
             on_first_write()
 
-        await ffplay.write_pcm(pcm, skip_flag_fn=skip_flag_fn)
+        await audio_stream.write_pcm(pcm, skip_flag_fn=skip_flag_fn)
 
         total_audio_secs += dur
         chunks_done += 1
@@ -345,7 +345,7 @@ async def render_speech(
 
             if seg_kind == 'sys':
                 # Play sys clip (or fall back to synthesizing in caller voice)
-                played = await _play_sys_clip(seg_content, ffplay, skip_flag_fn, gain)
+                played = await _play_sys_clip(seg_content, audio_stream, skip_flag_fn, gain)
                 if not played:
                     # Fallback: synthesize slug text in caller voice
                     readable = seg_content.replace('_', ' ')
@@ -408,7 +408,7 @@ async def render_speech(
                 break
 
             if seg_kind == 'sys':
-                played = await _play_sys_clip(seg_content, ffplay, skip_flag_fn, gain)
+                played = await _play_sys_clip(seg_content, audio_stream, skip_flag_fn, gain)
                 if not played:
                     readable = seg_content.replace('_', ' ')
                     if not await _synthesize_and_play_clause(readable, is_first=first_played):
@@ -433,7 +433,7 @@ async def render_speech(
             clause_offset += len(seg_clauses)
 
     total_ms = (time.monotonic() - item_t0) * 1000
-    proc_alive = ffplay.is_alive
+    proc_alive = audio_stream.is_alive
     print(
         f"speak-daemon: [q#{qid}] DONE   "
         f"total={total_ms:.0f}ms audio={total_audio_secs:.2f}s "

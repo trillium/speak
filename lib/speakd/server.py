@@ -60,170 +60,19 @@ class SpeakDaemon:
             raw_msg = await reader.readexactly(msg_len)
             request = json.loads(raw_msg.decode())
 
-            # --- Queue command dispatch (skip, clear, queue_status) ---
+            # --- Command dispatch via module-level registry (see COMMANDS) ---
             command = request.get("command")
             if command:
-                if command == "skip":
-                    result = await self.playback_queue.skip()
-                elif command == "clear":
-                    result = await self.playback_queue.clear()
-                elif command == "queue_status":
-                    result = self.playback_queue.status()
-                elif command == "pause":
-                    result = await self.playback_queue.pause()
-                elif command == "resume":
-                    result = self.playback_queue.resume()
-                elif command == "toggle_pause":
-                    result = await self.playback_queue.toggle_pause()
-                elif command == "replay":
-                    result = await self.playback_queue.replay()
-                elif command == "replay_by_id":
-                    row_id = request.get("id")
-                    if row_id is None:
-                        result = {"ok": False, "error": "replay_by_id requires 'id' field"}
-                    else:
-                        from_clause = request.get("from_clause")
-                        result = await self.playback_queue.replay_by_id(int(row_id), from_clause=from_clause)
-                elif command == "stats":
-                    q = self.playback_queue
-                    result = {
-                        "daemon": {
-                            "pid": os.getpid(),
-                            "uptime_secs": round(time.time() - self.start_time),
-                            "active_connections": self.active_connections,
-                        },
-                        "queue": {
-                            "total_enqueued": q.total_enqueued,
-                            "total_completed": q.total_completed,
-                            "total_skipped": q.total_skipped,
-                            "pending": q._queue.qsize(),
-                            "playing": q._current.get("text", "")[:80] if q._current else None,
-                            "resume_mid_clause": q._resume_mid_clause,
-                        },
-                        "cache": self.cache.stats(),
-                        "subscribers": self.subscriber_manager.status(),
-                    }
-                elif command == "voice_pool_status":
-                    result = {"ok": True, **self.voice_pool.status()}
-                elif command == "voice_release":
-                    voice = request.get("voice", "")
-                    if not voice:
-                        result = {"ok": False, "error": "voice_release requires 'voice' field"}
-                    else:
-                        released = self.voice_pool.release_voice(voice)
-                        result = {"ok": True, "released": released}
-                elif command == "list_devices":
-                    import sounddevice as sd
-                    devices = sd.query_devices()
-                    default_out = sd.default.device[1]
-                    output_devices = []
-                    for i, d in enumerate(devices):
-                        if d["max_output_channels"] > 0:
-                            output_devices.append({
-                                "index": i,
-                                "name": d["name"],
-                                "channels": d["max_output_channels"],
-                                "default": i == default_out,
-                            })
-                    result = {"ok": True, "devices": output_devices}
-                elif command == "set_device":
-                    device = request.get("device")
-                    if device is None:
-                        result = {"ok": False, "error": "set_device requires 'device' field (int index or string name)"}
-                    else:
-                        # Validate device before switching
-                        import sounddevice as sd
-                        try:
-                            if isinstance(device, int):
-                                info = sd.query_devices(device)
-                                if info["max_output_channels"] == 0:
-                                    result = {"ok": False, "error": f"device {device} has no output channels"}
-                                else:
-                                    await self.playback_queue.set_device(device)
-                                    result = {"ok": True, "device": {"index": device, "name": info["name"]}}
-                            else:
-                                # String name — resolve to index
-                                devices = sd.query_devices()
-                                needle = str(device).lower()
-                                matched = None
-                                for i, d in enumerate(devices):
-                                    if d["max_output_channels"] > 0 and needle in d["name"].lower():
-                                        matched = i
-                                        break
-                                if matched is None:
-                                    result = {"ok": False, "error": f"no output device matching '{device}'"}
-                                else:
-                                    await self.playback_queue.set_device(matched)
-                                    info = sd.query_devices(matched)
-                                    result = {"ok": True, "device": {"index": matched, "name": info["name"]}}
-                        except Exception as e:
-                            result = {"ok": False, "error": str(e)}
-                elif command == "history":
-                    n = request.get("n", 10)
-                    offset = request.get("offset", 0)
-                    entries, total = self.playback_queue._history.get(n, offset)
-                    result = {"ok": True, "entries": entries, "total": total}
-                elif command == "session_history":
-                    session = request.get("session", "")
-                    n = request.get("n", 10)
-                    offset = request.get("offset", 0)
-                    entries, total = self.playback_queue._history.get_by_session(session, n, offset)
-                    result = {"ok": True, "entries": entries, "total": total}
-                elif command == "caller_history":
-                    caller = request.get("caller", "")
-                    n = request.get("n", 10)
-                    offset = request.get("offset", 0)
-                    entries, total = self.playback_queue._history.get_by_caller(caller, n, offset)
-                    result = {"ok": True, "entries": entries, "total": total}
-                elif command == "caller_voice":
-                    caller = request.get("caller", "")
-                    if not caller:
-                        result = {"ok": False, "error": "caller_voice requires 'caller' field"}
-                    else:
-                        voice = self.playback_queue._history.last_voice_for_caller(caller)
-                        result = {"ok": True, "caller": caller, "voice": voice}
-                elif command == "set_resume_mid_clause":
-                    enabled = request.get("enabled")
-                    if enabled is None:
-                        result = {"ok": True, "resume_mid_clause": self.playback_queue._resume_mid_clause}
-                    else:
-                        self.playback_queue._resume_mid_clause = bool(enabled)
-                        result = {"ok": True, "resume_mid_clause": self.playback_queue._resume_mid_clause}
-                elif command == "subscribe":
-                    include_metadata = request.get("include_metadata", True)
-                    send_json(writer, {
-                        "ok": True, "subscribed": True,
-                        "sample_rate": 24000, "channels": 1, "format": "s16le",
-                    })
+                handler = COMMANDS.get(command)
+                if handler is None:
+                    send_json(writer, {"ok": False, "error": f"unknown command: {command}"})
                     await writer.drain()
-                    # Send current state so subscriber has context
-                    q = self.playback_queue
-                    if q._current:
-                        self.subscriber_manager.broadcast_metadata({
-                            "event": "item_start",
-                            "playing": {
-                                "id": q._current.get("_queue_id"),
-                                "caller": q._current.get("caller", ""),
-                                "voice": q._current.get("_resolved_voice", ""),
-                                "text": q._current.get("text", "")[:120],
-                            },
-                        })
-                    info = self.subscriber_manager.add(writer, include_metadata)
-                    # Keep connection alive until subscriber disconnects
-                    await info.disconnect_event.wait()
                     return
-                elif command == "play_tone":
-                    session = request.get("session", "")
-                    waveform = request.get("waveform", "pluck")
-                    if not session:
-                        result = {"ok": False, "error": "play_tone requires 'session' field"}
-                    else:
-                        from .tones import get_input_tone, get_caller_tone
-                        tone_pcm = get_input_tone(session) if waveform == "pluck" else get_caller_tone(session)
-                        await self.playback_queue._ffplay.write_pcm(tone_pcm)
-                        result = {"ok": True, "session": session, "waveform": waveform}
-                else:
-                    result = {"ok": False, "error": f"unknown command: {command}"}
+                result = await handler(self, request, writer)
+                if result is _HANDLED:
+                    # Handler owns the connection lifecycle (e.g. subscribe holds
+                    # it open); it has already replied and must not be closed here.
+                    return
                 send_json(writer, result)
                 await writer.drain()
                 return
@@ -353,6 +202,230 @@ class SpeakDaemon:
 
         async with server:
             await server.serve_forever()
+
+
+# ---------------------------------------------------------------------------
+# Command registry
+#
+# Each handler is `async def(daemon, request, writer) -> dict | _HANDLED`.
+# Returning a dict sends it as the JSON reply and closes the connection.
+# Returning _HANDLED means the handler already managed the reply / connection
+# (used by `subscribe`, which holds the socket open for broadcast frames) and
+# the dispatcher must not touch it further. Handlers reach queue state only
+# through PlaybackQueue's public API — never its underscore internals.
+# ---------------------------------------------------------------------------
+
+_HANDLED = object()
+
+
+async def _cmd_skip(daemon, request, writer):
+    return await daemon.playback_queue.skip()
+
+
+async def _cmd_clear(daemon, request, writer):
+    return await daemon.playback_queue.clear()
+
+
+async def _cmd_queue_status(daemon, request, writer):
+    return daemon.playback_queue.status()
+
+
+async def _cmd_pause(daemon, request, writer):
+    return await daemon.playback_queue.pause()
+
+
+async def _cmd_resume(daemon, request, writer):
+    return daemon.playback_queue.resume()
+
+
+async def _cmd_toggle_pause(daemon, request, writer):
+    return await daemon.playback_queue.toggle_pause()
+
+
+async def _cmd_replay(daemon, request, writer):
+    return await daemon.playback_queue.replay()
+
+
+async def _cmd_replay_by_id(daemon, request, writer):
+    row_id = request.get("id")
+    if row_id is None:
+        return {"ok": False, "error": "replay_by_id requires 'id' field"}
+    from_clause = request.get("from_clause")
+    return await daemon.playback_queue.replay_by_id(int(row_id), from_clause=from_clause)
+
+
+async def _cmd_stats(daemon, request, writer):
+    q = daemon.playback_queue
+    return {
+        "daemon": {
+            "pid": os.getpid(),
+            "uptime_secs": round(time.time() - daemon.start_time),
+            "active_connections": daemon.active_connections,
+        },
+        "queue": {
+            "total_enqueued": q.total_enqueued,
+            "total_completed": q.total_completed,
+            "total_skipped": q.total_skipped,
+            "pending": q.pending_count(),
+            "playing": q.current_summary(),
+            "resume_mid_clause": q.resume_mid_clause,
+        },
+        "cache": daemon.cache.stats(),
+        "subscribers": daemon.subscriber_manager.status(),
+    }
+
+
+async def _cmd_voice_pool_status(daemon, request, writer):
+    return {"ok": True, **daemon.voice_pool.status()}
+
+
+async def _cmd_voice_release(daemon, request, writer):
+    voice = request.get("voice", "")
+    if not voice:
+        return {"ok": False, "error": "voice_release requires 'voice' field"}
+    released = daemon.voice_pool.release_voice(voice)
+    return {"ok": True, "released": released}
+
+
+async def _cmd_list_devices(daemon, request, writer):
+    import sounddevice as sd
+    devices = sd.query_devices()
+    default_out = sd.default.device[1]
+    output_devices = []
+    for i, d in enumerate(devices):
+        if d["max_output_channels"] > 0:
+            output_devices.append({
+                "index": i,
+                "name": d["name"],
+                "channels": d["max_output_channels"],
+                "default": i == default_out,
+            })
+    return {"ok": True, "devices": output_devices}
+
+
+async def _cmd_set_device(daemon, request, writer):
+    device = request.get("device")
+    if device is None:
+        return {"ok": False, "error": "set_device requires 'device' field (int index or string name)"}
+    # Validate the device before switching.
+    import sounddevice as sd
+    try:
+        if isinstance(device, int):
+            info = sd.query_devices(device)
+            if info["max_output_channels"] == 0:
+                return {"ok": False, "error": f"device {device} has no output channels"}
+            await daemon.playback_queue.set_device(device)
+            return {"ok": True, "device": {"index": device, "name": info["name"]}}
+        # String name — resolve to an index by substring match.
+        devices = sd.query_devices()
+        needle = str(device).lower()
+        matched = None
+        for i, d in enumerate(devices):
+            if d["max_output_channels"] > 0 and needle in d["name"].lower():
+                matched = i
+                break
+        if matched is None:
+            return {"ok": False, "error": f"no output device matching '{device}'"}
+        await daemon.playback_queue.set_device(matched)
+        info = sd.query_devices(matched)
+        return {"ok": True, "device": {"index": matched, "name": info["name"]}}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def _cmd_history(daemon, request, writer):
+    n = request.get("n", 10)
+    offset = request.get("offset", 0)
+    entries, total = daemon.playback_queue.history_get(n, offset)
+    return {"ok": True, "entries": entries, "total": total}
+
+
+async def _cmd_session_history(daemon, request, writer):
+    session = request.get("session", "")
+    n = request.get("n", 10)
+    offset = request.get("offset", 0)
+    entries, total = daemon.playback_queue.history_by_session(session, n, offset)
+    return {"ok": True, "entries": entries, "total": total}
+
+
+async def _cmd_caller_history(daemon, request, writer):
+    caller = request.get("caller", "")
+    n = request.get("n", 10)
+    offset = request.get("offset", 0)
+    entries, total = daemon.playback_queue.history_by_caller(caller, n, offset)
+    return {"ok": True, "entries": entries, "total": total}
+
+
+async def _cmd_caller_voice(daemon, request, writer):
+    caller = request.get("caller", "")
+    if not caller:
+        return {"ok": False, "error": "caller_voice requires 'caller' field"}
+    voice = daemon.playback_queue.last_voice_for_caller(caller)
+    return {"ok": True, "caller": caller, "voice": voice}
+
+
+async def _cmd_set_resume_mid_clause(daemon, request, writer):
+    q = daemon.playback_queue
+    enabled = request.get("enabled")
+    if enabled is None:
+        return {"ok": True, "resume_mid_clause": q.resume_mid_clause}
+    q.resume_mid_clause = bool(enabled)
+    return {"ok": True, "resume_mid_clause": q.resume_mid_clause}
+
+
+async def _cmd_play_tone(daemon, request, writer):
+    session = request.get("session", "")
+    waveform = request.get("waveform", "pluck")
+    if not session:
+        return {"ok": False, "error": "play_tone requires 'session' field"}
+    from .tones import get_input_tone, get_caller_tone
+    tone_pcm = get_input_tone(session) if waveform == "pluck" else get_caller_tone(session)
+    await daemon.playback_queue.play_raw_pcm(tone_pcm)
+    return {"ok": True, "session": session, "waveform": waveform}
+
+
+async def _cmd_subscribe(daemon, request, writer):
+    include_metadata = request.get("include_metadata", True)
+    send_json(writer, {
+        "ok": True, "subscribed": True,
+        "sample_rate": 24000, "channels": 1, "format": "s16le",
+    })
+    await writer.drain()
+    # Send current state so the subscriber has immediate context.
+    current = daemon.playback_queue.current_broadcast()
+    if current is not None:
+        daemon.subscriber_manager.broadcast_metadata({
+            "event": "item_start",
+            "playing": current,
+        })
+    info = daemon.subscriber_manager.add(writer, include_metadata)
+    # Keep the connection alive until the subscriber disconnects.
+    await info.disconnect_event.wait()
+    return _HANDLED
+
+
+COMMANDS = {
+    "skip": _cmd_skip,
+    "clear": _cmd_clear,
+    "queue_status": _cmd_queue_status,
+    "pause": _cmd_pause,
+    "resume": _cmd_resume,
+    "toggle_pause": _cmd_toggle_pause,
+    "replay": _cmd_replay,
+    "replay_by_id": _cmd_replay_by_id,
+    "stats": _cmd_stats,
+    "voice_pool_status": _cmd_voice_pool_status,
+    "voice_release": _cmd_voice_release,
+    "list_devices": _cmd_list_devices,
+    "set_device": _cmd_set_device,
+    "history": _cmd_history,
+    "session_history": _cmd_session_history,
+    "caller_history": _cmd_caller_history,
+    "caller_voice": _cmd_caller_voice,
+    "set_resume_mid_clause": _cmd_set_resume_mid_clause,
+    "play_tone": _cmd_play_tone,
+    "subscribe": _cmd_subscribe,
+}
 
 
 def cleanup_and_exit():

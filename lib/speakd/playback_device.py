@@ -1,4 +1,4 @@
-"""Audio output via sounddevice (PortAudio) — drop-in replacement for FFPlayStream.
+"""Audio output via sounddevice (PortAudio).
 
 sounddevice.RawOutputStream opens the device synchronously, so when start()
 returns, the device IS ready. No silence priming needed.
