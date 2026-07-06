@@ -11,6 +11,7 @@ Skip kills the ffplay process (next write auto-restarts it).
 import asyncio
 import sys
 import time
+import traceback
 from typing import Callable
 
 from .playback_device import AudioOutputStream
@@ -60,6 +61,7 @@ class PlaybackQueue:
         self._resume_event = asyncio.Event()
         self._resume_event.set()  # starts unblocked
         self._priority_request = None  # jump-the-line item
+        self._paused_request: dict | None = None  # holds item to replay after resume
         self._resume_mid_clause = True  # toggle: resume from interrupted clause vs. start
 
     def record_history(self, text: str, caller: str = "", session: str = "") -> int:
@@ -264,7 +266,6 @@ class PlaybackQueue:
     async def _worker(self):
         loop = asyncio.get_event_loop()
         self._publish("idle")
-        self._paused_request = None  # holds item to replay after resume
         while True:
             # Priority: paused replay > priority enqueue > normal queue
             if self._paused_request is not None:
@@ -464,6 +465,7 @@ class PlaybackQueue:
                 self.total_completed += 1
             except Exception as e:
                 print(f"speak-daemon: queue playback error: {e}", file=sys.stderr)
+                print(traceback.format_exc(), file=sys.stderr)
             finally:
                 # If this was a pause, stash the item for replay on resume
                 if self._paused:
