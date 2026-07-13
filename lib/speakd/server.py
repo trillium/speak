@@ -381,6 +381,67 @@ async def _cmd_play_tone(daemon, request, writer):
     return {"ok": True, "session": session, "waveform": waveform}
 
 
+async def _cmd_synth(daemon, request, writer):
+    """Synthesize text and return WAV bytes (base64) — no local playback.
+
+    Serves remote surfaces (e.g. the Parlay panel) that play the audio on
+    their own device. Reuses the same kokoro streaming path as playback
+    rendering so pronunciation, clause splitting, and voice-pool behavior
+    match spoken output. CPU inference runs on kokoro's internal thread via
+    create_stream, so the event loop is not starved for long texts.
+    """
+    import base64
+    import io
+    import wave
+
+    import numpy as np
+
+    from .text import split_clauses
+
+    text = str(request.get("text", "")).strip()[:2000]
+    if not text:
+        return {"ok": False, "error": "synth requires 'text'"}
+
+    caller = str(request.get("caller", "") or "")
+    session = str(request.get("session", "") or "")
+    requested_voice = str(request.get("voice", "") or "")
+    if requested_voice:
+        voice_name = requested_voice
+    elif caller:
+        voice_name, _gain, _is_new = daemon.voice_pool.get_voice(caller, session, "af_heart")
+    else:
+        voice_name = "af_heart"
+    speed = float(request.get("speed", DEFAULT_SPEED))
+    lang = str(request.get("lang", "en-us"))
+
+    daemon._touch_activity()
+    chunks = []
+    for clause in split_clauses(text):
+        async for audio, _sr in daemon.synth.kokoro.create_stream(
+            clause, voice_name, speed, lang, trim=False
+        ):
+            chunks.append(audio.squeeze())
+    if not chunks:
+        return {"ok": False, "error": "no audio produced"}
+
+    full = np.concatenate(chunks)
+    pcm = (full * 32767).astype(np.int16).tobytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(pcm)
+
+    return {
+        "ok": True,
+        "voice": voice_name,
+        "sample_rate": 24000,
+        "seconds": round(len(full) / 24000, 2),
+        "wav_b64": base64.b64encode(buf.getvalue()).decode(),
+    }
+
+
 async def _cmd_subscribe(daemon, request, writer):
     include_metadata = request.get("include_metadata", True)
     send_json(writer, {
@@ -421,6 +482,7 @@ COMMANDS = {
     "caller_voice": _cmd_caller_voice,
     "set_resume_mid_clause": _cmd_set_resume_mid_clause,
     "play_tone": _cmd_play_tone,
+    "synth": _cmd_synth,
     "subscribe": _cmd_subscribe,
 }
 
