@@ -1,9 +1,11 @@
 """Playback queue: FIFO queue for fire-and-forget TTS over a live audio stream.
 
-A single AudioOutputStream (sounddevice/PortAudio) stays open for the lifetime
-of the queue, receiving a continuous PCM stream. Items flow seamlessly with no
-gaps. The worker uses time-based tracking to know when each item's audio has
-finished playing, keeping queue status accurate.
+A single AudioOutputStream (sounddevice/PortAudio) stays open across items,
+receiving a continuous PCM stream, so items flow seamlessly with no gaps. Before
+each item the worker calls refresh_default(), which reopens the stream only when
+the macOS default output device has changed since the last item — steady-state
+playback keeps the same open stream. The worker uses time-based tracking to know
+when each item's audio has finished playing, keeping queue status accurate.
 
 Skip aborts the audio stream (the next write reopens it automatically).
 """
@@ -346,6 +348,11 @@ class PlaybackQueue:
                     continue
             self._current = request
             self._skip_flag = False
+            # Follow the CURRENT macOS default output. If the user changed the
+            # default device since the last item, this drops the stale stream so
+            # the first write below reopens on the new default (and recovers off
+            # a previous speakers-fallback once the real default works again).
+            await self._audio.refresh_default()
             chunks_done = 0  # tracks clause progress for resume-from-clause
             is_resume = request.get("_is_resume", False)
             skip_history = request.get("_skip_history", False)
