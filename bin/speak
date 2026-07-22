@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Hard kill-switch: when this flag file exists, speak is fully disabled — no
+# daemon start, no audio, no tones. Every invocation (hooks included) no-ops.
+# Reverse with: rm ~/.speak-disabled
+if [[ -f "${HOME}/.speak-disabled" ]]; then exit 0; fi
+
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 KOKORO_DIR="${HOME}/.local/share/speak/kokoro"
 PIPER_VOICES_DIR="${HOME}/.local/share/speak/voices"
@@ -78,7 +83,9 @@ Options:
   --voices          List available voices for the selected engine
   --devices         List audio output devices (with index numbers)
   --device ID       Audio device for daemon (index or name substring)
-  --set-device ID   Switch audio device on running daemon
+  --set-device ID   Pin audio device (persists across daemon restarts)
+  --set-device default   Clear the pin; follow the current system default
+  --show-device     Show the pinned audio device setting
   --daemon          Show daemon status / start it
   --restart         Restart the daemon
   --stop            Stop the daemon
@@ -153,7 +160,9 @@ Audio device selection:
   speak --devices                      List output devices with index numbers
   speak --device 3 --daemon            Start daemon on device index 3
   speak --device "Jabra" --daemon      Start daemon matching device name
-  speak --set-device 5                 Switch device on running daemon
+  speak --set-device "Jabra"           Pin a device; persists across restarts
+  speak --set-device default           Clear the pin; follow system default
+  speak --show-device                  Show the pinned device setting
 
 Examples:
   speak "Hello world"
@@ -277,11 +286,13 @@ start_daemon() {
 
     mkdir -p "${HOME}/.local/share/speak" "${HOME}/Library/LaunchAgents"
 
-    # Persistent device selection now lives in the plist args (Standard*Path +
-    # launchd own the log; rotation is manual/newsyslog territory).
+    # Persistent device selection is a speak setting now (see --set-device /
+    # --show-device); the daemon reads it on startup. --device here is only a
+    # one-off launch override and does NOT reach the launchd-managed daemon.
     if [[ -n "${DEVICE}" ]]; then
-        echo "speak: note — persistent device selection now lives in the launchd plist." >&2
-        echo "       Add --device args to ${LAUNCHD_PLIST_SRC} and reinstall, or use --set-device for a runtime switch." >&2
+        echo "speak: note — to pin an output device that survives restarts, use:" >&2
+        echo "         speak --set-device \"${DEVICE}\"" >&2
+        echo "       (--device is a one-off override and won't reach the launchd daemon)." >&2
     fi
 
     if launchd_service_loaded; then
@@ -389,6 +400,7 @@ restart_daemon() {
 # --- Parse arguments ---
 LIST_VOICES=false
 LIST_DEVICES=false
+SHOW_DEVICE=false
 DAEMON_CMD=""
 QUEUE_CMD=""
 TEXT_ARGS=()
@@ -403,6 +415,7 @@ while [[ $# -gt 0 ]]; do
         --devices)    LIST_DEVICES=true; shift ;;
         --device)     DEVICE="$2"; shift 2 ;;
         --set-device) SET_DEVICE="$2"; shift 2 ;;
+        --show-device) SHOW_DEVICE=true; shift ;;
         --daemon)     DAEMON_CMD="status"; shift ;;
         --restart)    DAEMON_CMD="restart"; shift ;;
         --stop)       DAEMON_CMD="stop"; shift ;;
@@ -742,9 +755,34 @@ if [[ -n "${SET_DEVICE:-}" ]]; then
     fi
     _sd_resp="$(python3 "${SCRIPT_DIR}/speak-client" --command set_device --json "${_sd_json}")"
     if [[ "$(printf '%s' "${_sd_resp}" | jq -r '.ok')" == "true" ]]; then
-        printf '%s' "${_sd_resp}" | jq -r '"speak: switched to device \(.device.index) (\(.device.name))"'
+        if [[ "$(printf '%s' "${_sd_resp}" | jq -r '.cleared // false')" == "true" ]]; then
+            echo "speak: cleared pinned device — now following the current system default"
+        else
+            printf '%s' "${_sd_resp}" | jq -r '"speak: switched to device \(.device.index) (\(.device.name)) — pinned; survives daemon restarts"'
+        fi
     else
         echo "speak: error: $(printf '%s' "${_sd_resp}" | jq -r '.error // "unknown"')" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+# --- Handle --show-device (show the pinned output device setting) ---
+if [[ "${SHOW_DEVICE:-false}" == true ]]; then
+    if ! daemon_is_running; then
+        echo "speak: daemon not running (start with: speak --daemon)" >&2
+        exit 1
+    fi
+    _shd_resp="$(python3 "${SCRIPT_DIR}/speak-client" --command show_device --json '{}')"
+    if [[ "$(printf '%s' "${_shd_resp}" | jq -r '.ok')" == "true" ]]; then
+        if [[ "$(printf '%s' "${_shd_resp}" | jq -r '.pinned // "null"')" == "null" ]]; then
+            echo "speak: no pinned device — following the current system default output"
+        else
+            printf '%s' "${_shd_resp}" | jq -r '"speak: pinned device: \(.pinned)"'
+        fi
+        printf '%s' "${_shd_resp}" | jq -r '"       settings: \(.settings_path)"'
+    else
+        echo "speak: error: $(printf '%s' "${_shd_resp}" | jq -r '.error // "unknown"')" >&2
         exit 1
     fi
     exit 0

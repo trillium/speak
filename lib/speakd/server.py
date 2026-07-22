@@ -11,7 +11,16 @@ import time
 from kokoro_onnx import Kokoro
 
 from .cache import AudioCache
-from .config import CACHE_DIR, CACHE_TTL_DAYS, DEFAULT_SPEED, IDLE_TIMEOUT, SOCKET_PATH
+from .config import (
+    CACHE_DIR,
+    CACHE_TTL_DAYS,
+    DEFAULT_SPEED,
+    IDLE_TIMEOUT,
+    SETTINGS_PATH,
+    SOCKET_PATH,
+    load_settings,
+    save_setting,
+)
 from .kokoro_patch import apply_patch
 from .playback import PlaybackQueue
 from .protocol import send_json
@@ -304,6 +313,13 @@ async def _cmd_set_device(daemon, request, writer):
     device = request.get("device")
     if device is None:
         return {"ok": False, "error": "set_device requires 'device' field (int index or string name)"}
+    # Clearing the pin: revert to following the current system default and
+    # remove the persisted preference so a later daemon restart also follows
+    # the default instead of a stale pin.
+    if isinstance(device, str) and device.strip().lower() in ("default", "clear", ""):
+        await daemon.playback_queue.set_device(None)
+        save_setting("output_device", None)
+        return {"ok": True, "cleared": True, "device": None}
     # Validate the device before switching.
     import sounddevice as sd
     try:
@@ -312,7 +328,10 @@ async def _cmd_set_device(daemon, request, writer):
             if info["max_output_channels"] == 0:
                 return {"ok": False, "error": f"device {device} has no output channels"}
             await daemon.playback_queue.set_device(device)
-            return {"ok": True, "device": {"index": device, "name": info["name"]}}
+            # Persist by NAME, not index: indices are unstable across daemon
+            # restarts, but the name re-resolves reliably on next startup.
+            persisted = save_setting("output_device", info["name"])
+            return {"ok": True, "device": {"index": device, "name": info["name"]}, "persisted": persisted}
         # String name — resolve to an index by substring match.
         devices = sd.query_devices()
         needle = str(device).lower()
@@ -325,9 +344,26 @@ async def _cmd_set_device(daemon, request, writer):
             return {"ok": False, "error": f"no output device matching '{device}'"}
         await daemon.playback_queue.set_device(matched)
         info = sd.query_devices(matched)
-        return {"ok": True, "device": {"index": matched, "name": info["name"]}}
+        # Persist the user's substring intent so the pin follows the same
+        # device family across index shifts (e.g. "Jabra" -> whatever Jabra is).
+        persisted = save_setting("output_device", str(device))
+        return {"ok": True, "device": {"index": matched, "name": info["name"]}, "persisted": persisted}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+async def _cmd_show_device(daemon, request, writer):
+    """Report the persisted pinned device (if any) and where it's stored.
+
+    pinned=None means no pin: speak follows the current system default output.
+    """
+    pinned = load_settings().get("output_device")
+    return {
+        "ok": True,
+        "pinned": pinned,
+        "following_default": pinned is None,
+        "settings_path": str(SETTINGS_PATH),
+    }
 
 
 async def _cmd_history(daemon, request, writer):
@@ -476,6 +512,7 @@ COMMANDS = {
     "voice_release": _cmd_voice_release,
     "list_devices": _cmd_list_devices,
     "set_device": _cmd_set_device,
+    "show_device": _cmd_show_device,
     "history": _cmd_history,
     "session_history": _cmd_session_history,
     "caller_history": _cmd_caller_history,
@@ -508,26 +545,55 @@ def main():
     parser.add_argument("--device", default=None, help="Audio output device (index or name substring)")
     args = parser.parse_args()
 
-    # Parse device: try int first, else keep as string for name matching
+    # Device precedence: explicit --device arg (highest) > persisted pinned
+    # setting > follow the current system default (device=None). The MacBook
+    # speakers remain the emergency fallback inside AudioOutputStream only when
+    # the chosen device can't be opened.
     device = args.device
+    device_from_settings = False
+    if device is None:
+        pinned = load_settings().get("output_device")
+        if pinned:
+            device = pinned
+            device_from_settings = True
+            print(
+                f"speak-daemon: honoring pinned output device from settings: {pinned!r}",
+                file=sys.stderr,
+            )
+
+    # Parse device: try int first, else keep as string for name matching
     if device is not None:
         try:
             device = int(device)
-        except ValueError:
-            # String name — resolve to index at startup
-            import sounddevice as sd
-            devices = sd.query_devices()
-            needle = device.lower()
-            matched = None
-            for i, d in enumerate(devices):
-                if d["max_output_channels"] > 0 and needle in d["name"].lower():
-                    matched = i
-                    break
-            if matched is None:
-                print(f"speak-daemon: no output device matching '{device}'", file=sys.stderr)
-                sys.exit(1)
-            print(f"speak-daemon: resolved device '{device}' -> index {matched} ({devices[matched]['name']})", file=sys.stderr)
-            device = matched
+        except (ValueError, TypeError):
+            if device_from_settings:
+                # Persisted device name: do NOT resolve to an index or exit on
+                # miss here. Pass the name through — AudioOutputStream opens it
+                # by substring at stream time and falls back to the built-in
+                # speakers if it's currently unavailable, so a disconnected
+                # pinned device (e.g. a powered-off Jabra) never crashes daemon
+                # startup and is re-attempted on the next stream reopen.
+                print(
+                    f"speak-daemon: will open pinned device by name {device!r} "
+                    f"(built-in speakers fallback if unavailable)",
+                    file=sys.stderr,
+                )
+            else:
+                # Explicit --device name — resolve to index at startup; a bad
+                # explicit request fails loudly (unchanged behavior).
+                import sounddevice as sd
+                devices = sd.query_devices()
+                needle = device.lower()
+                matched = None
+                for i, d in enumerate(devices):
+                    if d["max_output_channels"] > 0 and needle in d["name"].lower():
+                        matched = i
+                        break
+                if matched is None:
+                    print(f"speak-daemon: no output device matching '{device}'", file=sys.stderr)
+                    sys.exit(1)
+                print(f"speak-daemon: resolved device '{device}' -> index {matched} ({devices[matched]['name']})", file=sys.stderr)
+                device = matched
 
     # Signal handling for clean shutdown is installed inside run() via
     # loop.add_signal_handler once the event loop exists. Before the loop

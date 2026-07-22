@@ -1,11 +1,58 @@
 """Configuration constants for the speak daemon."""
 
+import json
 import os
 import pathlib
 
 # --- Socket and state paths ---
 SOCKET_PATH = f"/tmp/speak-{os.environ['USER']}.sock"
 STATE_PATH = f"/tmp/speak-{os.environ['USER']}.state.json"
+
+# --- Persistent settings (survive daemon restarts; deliberately NOT /tmp) ---
+# Home for durable, user-chosen preferences the daemon honors on startup, e.g.
+# a pinned audio output device. Kept separate from the volatile STATE_PATH so a
+# launchd restart never loses the choice.
+SETTINGS_DIR = pathlib.Path(os.environ.get(
+    "SPEAK_SETTINGS_DIR",
+    os.path.join(
+        os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+        "speak",
+    ),
+))
+SETTINGS_PATH = SETTINGS_DIR / "settings.json"
+
+
+def load_settings() -> dict:
+    """Load persisted settings. Tolerant: missing or corrupt file yields {}."""
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def save_setting(key: str, value) -> bool:
+    """Persist a single setting; value=None removes the key.
+
+    Atomic write (tmp + os.replace). Best-effort: returns True on success,
+    False on any filesystem error, and never raises so a set-device call can't
+    crash the daemon over a disk hiccup.
+    """
+    settings = load_settings()
+    if value is None:
+        settings.pop(key, None)
+    else:
+        settings[key] = value
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+        os.replace(tmp, SETTINGS_PATH)
+        return True
+    except OSError:
+        return False
 
 # --- Timeouts ---
 IDLE_TIMEOUT = 300  # shut down after 5 minutes idle
