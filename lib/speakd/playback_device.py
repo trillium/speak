@@ -14,6 +14,13 @@ from .config import SAMPLE_RATE
 # Write PCM in small chunks so PortAudio backpressure naturally paces us.
 WRITE_CHUNK_BYTES = int(SAMPLE_RATE * 2 * 0.25)  # 0.25s of audio per write
 
+# Always-present built-in output. When the configured/system-default device
+# can't be opened (classic case: the system default is a disconnected
+# Bluetooth headset, which PortAudio still reports as default and then fails to
+# open with -9986), we fall back to this so audio never silently dies. Matched
+# by substring, so it survives shifting device indices.
+FALLBACK_DEVICE = "MacBook Pro Speakers"
+
 
 class AudioOutputStream:
     """Manages a sounddevice RawOutputStream for continuous PCM streaming."""
@@ -63,20 +70,40 @@ class AudioOutputStream:
 
         loop = asyncio.get_event_loop()
 
-        device = self._device
+        # Try the configured device first (None = system default). If it can't
+        # be opened, fall back to the built-in speakers so a dead default
+        # device (e.g. a disconnected Bluetooth headset) never silences speak.
+        candidates = [self._device]
+        if self._device != FALLBACK_DEVICE:
+            candidates.append(FALLBACK_DEVICE)
 
-        def _open():
-            s = sd.RawOutputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="int16",
-                latency="low",
-                device=device,
-            )
-            s.start()
-            return s
+        last_err: Exception | None = None
+        for cand in candidates:
+            def _open(device=cand):
+                s = sd.RawOutputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=1,
+                    dtype="int16",
+                    latency="low",
+                    device=device,
+                )
+                s.start()
+                return s
 
-        self._stream = await loop.run_in_executor(None, _open)
+            try:
+                self._stream = await loop.run_in_executor(None, _open)
+                if cand != self._device:
+                    print(
+                        f"speak-daemon: audio device {self._device!r} unavailable, "
+                        f"fell back to {cand!r}",
+                        file=sys.stderr,
+                    )
+                return
+            except Exception as e:  # noqa: BLE001 — try next candidate
+                last_err = e
+
+        # Every candidate failed — surface the original error.
+        raise last_err
 
     async def write_pcm(self, pcm: bytes, skip_flag_fn=None) -> float:
         """Write PCM to the audio device in small chunks for backpressure pacing.
