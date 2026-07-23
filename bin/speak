@@ -964,14 +964,68 @@ fi
 # Kokoro engine (daemon-backed)
 # =============================================================================
 speak_kokoro() {
-    # --save writes a WAV via the kokoro-tts CLI directly (proper WAV headers)
-    # and needs no daemon — handle it before the daemon path.
+    # --save writes a WAV file and needs no daemon — handle it before the daemon
+    # path. robots-4cb: the kokoro-tts CLI feeds tokens/style/speed but the v1.0
+    # ONNX model requires input_ids, so it silently exits 0 writing NOTHING. Route
+    # --save through the kokoro-onnx engine (bin/kokoro-stream) that already backs
+    # live playback — it emits raw s16le PCM (mono, 24 kHz) and patches the
+    # speed-dtype bug — then wrap the PCM into a real WAV via stdlib `wave`. Every
+    # failure is LOUD (non-zero exit): a saved-nothing must never look like success.
     if [[ -n "${SAVE_FILE}" ]]; then
         local model="${KOKORO_DIR}/kokoro-v1.0.onnx"
         local voices="${KOKORO_DIR}/voices-v1.0.bin"
-        printf '%s' "${TEXT}" | uv run --python 3.14 --with kokoro-tts -- kokoro-tts - "${SAVE_FILE}" \
-            --voice "${VOICE}" --speed "${SPEED}" \
-            --model "${model}" --voices "${voices}" 2>&1 | grep -v "^Consider"
+        local stream="${SCRIPT_DIR}/kokoro-stream"
+        if [[ ! -f "${stream}" ]]; then
+            echo "speak: --save failed — kokoro-stream not found at ${stream}" >&2
+            exit 1
+        fi
+        if [[ ! -f "${model}" || ! -f "${voices}" ]]; then
+            echo "speak: --save failed — kokoro model/voices missing under ${KOKORO_DIR}" >&2
+            exit 1
+        fi
+        local pcm_tmp
+        pcm_tmp="$(mktemp "${TMPDIR:-/tmp}/speak-save.XXXXXX.pcm")" || {
+            echo "speak: --save failed — could not create temp file" >&2
+            exit 1
+        }
+        # Render → raw PCM. Do NOT mask the render exit code behind a pipe.
+        if ! printf '%s' "${TEXT}" | uv run --python 3.14 --with kokoro-onnx -- \
+                python3 "${stream}" \
+                --model "${model}" --voices "${voices}" \
+                --voice "${VOICE}" --speed "${SPEED}" > "${pcm_tmp}" 2>/dev/null; then
+            rm -f "${pcm_tmp}"
+            echo "speak: --save failed — kokoro-onnx render error; nothing written to ${SAVE_FILE}" >&2
+            exit 1
+        fi
+        if [[ ! -s "${pcm_tmp}" ]]; then
+            rm -f "${pcm_tmp}"
+            echo "speak: --save failed — kokoro-onnx produced no audio; nothing written to ${SAVE_FILE}" >&2
+            exit 1
+        fi
+        # Wrap PCM (mono, s16le, 24 kHz) into a proper WAV. stdlib `wave` only.
+        if ! python3 - "${pcm_tmp}" "${SAVE_FILE}" <<'PY'
+import sys, wave
+pcm = open(sys.argv[1], "rb").read()
+if len(pcm) % 2:  # s16le is 2 bytes/sample; drop a stray odd byte, don't corrupt a frame
+    pcm = pcm[:-1]
+with wave.open(sys.argv[2], "wb") as w:
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(24000)
+    w.writeframes(pcm)
+PY
+        then
+            rm -f "${pcm_tmp}"
+            echo "speak: --save failed — could not wrap PCM into WAV at ${SAVE_FILE}" >&2
+            exit 1
+        fi
+        rm -f "${pcm_tmp}"
+        # Final proof: the file must exist and be non-trivial. Never claim success
+        # for a zero-byte or missing WAV (the original silent-failure bug).
+        if [[ ! -s "${SAVE_FILE}" ]]; then
+            echo "speak: --save failed — wrote nothing to ${SAVE_FILE}" >&2
+            exit 1
+        fi
         echo "speak: saved to ${SAVE_FILE}" >&2
         return
     fi
