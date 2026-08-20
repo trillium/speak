@@ -1,0 +1,1 @@
+../../pai-hooks/lib/hook-io.ts
