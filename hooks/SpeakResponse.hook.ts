@@ -15,7 +15,7 @@
  * Depends on: ~/code/speak/bin/speak (Kokoro TTS daemon)
  */
 
-import { readHookInput, parseTranscriptFromInput } from './lib/hook-io';
+import { readHookInput, parseTranscriptFromInput } from '../lib/hook-io';
 import { spawnSync } from 'child_process';
 
 const SPEAK = `${process.env.HOME}/code/speak/bin/speak`;
