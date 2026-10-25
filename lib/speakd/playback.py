@@ -18,6 +18,7 @@ import traceback
 from typing import Callable
 
 from .config import DEFAULT_SPEED
+from .deepgram import is_valid_model as _is_deepgram_voice
 from .playback_device import AudioOutputStream
 from .history import SpeechHistory
 from .protocol import publish_state
@@ -157,6 +158,9 @@ class PlaybackQueue:
             "_fixed_voice": True,   # bypass voice pool
             "_skip_history": True,  # don't record again
         }
+        if _is_deepgram_voice(entry["voice"]):
+            # History stores only the voice; a Deepgram voice name replays via Deepgram.
+            req["engine"] = "deepgram"
         if from_clause is not None:
             req["_resume_from_clause"] = int(from_clause)
         self._id_counter += 1
@@ -385,8 +389,10 @@ class PlaybackQueue:
                 session = request.get("session", "")
                 is_new_claim = False
                 gain = 1.0
-                if request.get("_fixed_voice"):
-                    # Replay-by-id: use the voice from the request, skip pool
+                if request.get("_fixed_voice") or request.get("engine") == "deepgram":
+                    # Replay-by-id: use the voice from the request, skip pool.
+                    # Deepgram voices aren't Kokoro pool voices, so they always
+                    # bypass the pool too.
                     pass
                 elif caller and self.voice_pool:
                     voice_name, gain, is_new_claim = self.voice_pool.get_voice(
@@ -440,7 +446,10 @@ class PlaybackQueue:
                     # resuming mid-clause skips the first clause anyway.
                     t_prefetch_start = _ts()
                     prefetch_task = asyncio.create_task(
-                        prefetch_first_chunk(self.synth, text, voice_name, speed, lang)
+                        prefetch_first_chunk(
+                            self.synth, text, voice_name, speed, lang,
+                            engine=request.get("engine"),
+                        )
                     )
 
                 # Start tone

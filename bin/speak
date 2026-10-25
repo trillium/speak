@@ -13,6 +13,8 @@ SOCK_PATH="/tmp/speak-${USER}.sock"
 ENGINE="kokoro"
 DEFAULT_KOKORO_VOICE="af_heart"
 DEFAULT_PIPER_VOICE="en_US-ryan-high"
+DEFAULT_DEEPGRAM_VOICE="aura-2-thalia-en"  # mirrors lib/speakd/deepgram.py DEFAULT_VOICE
+ENGINE_FROM_FLAG=false
 SPEED="1.26"  # mirrors lib/speakd/config.py DEFAULT_SPEED
 SAVE_FILE=""
 VOICE=""
@@ -71,13 +73,14 @@ usage() {
     cat <<'EOF'
 Usage: speak [OPTIONS] [TEXT...]
 
-Speak text aloud using local TTS (Kokoro or Piper).
+Speak text aloud using local TTS (Kokoro or Piper) or Deepgram cloud TTS.
 
 Text can be provided as arguments or piped via stdin.
 
 Options:
-  --engine ENGINE   TTS engine: kokoro (default) or piper
-  --voice NAME      Voice name (default: af_heart for kokoro, en_US-ryan-high for piper)
+  --engine ENGINE   TTS engine: kokoro (default), piper, or deepgram (needs DEEPGRAM_API_KEY)
+  --voice NAME      Voice name (default: af_heart for kokoro, en_US-ryan-high for piper,
+                    aura-2-thalia-en for deepgram)
   --speed FLOAT     Speech speed (default: 1.26)
   --save FILE       Save to WAV file instead of playing
   --voices          List available voices for the selected engine
@@ -169,6 +172,7 @@ Examples:
   echo "piped text" | speak
   speak --voice am_adam "Male voice"
   speak --engine piper --voice en_US-lessac-high "Using Piper"
+  speak --engine deepgram --voice aura-2-thalia-en "Using Deepgram"
   speak --speed 1.2 "Faster speech"
   speak --save output.wav "Saved to file"
   speak --voices
@@ -407,7 +411,7 @@ TEXT_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)    usage ;;
-        --engine)     ENGINE="$2"; shift 2 ;;
+        --engine)     ENGINE="$2"; ENGINE_FROM_FLAG=true; shift 2 ;;
         --voice)      VOICE="$2"; shift 2 ;;
         --speed)      SPEED="$2"; shift 2 ;;
         --save)       SAVE_FILE="$2"; shift 2 ;;
@@ -912,12 +916,31 @@ if [[ -n "${AGENT_REPEAT_PID:-}" ]]; then
     exit 0
 fi
 
+# --- Resolve engine: --engine flag > $SPEAK_ENGINE > settings.json "engine" > kokoro ---
+# settings.json is the daemon's persisted-settings file (see lib/speakd/config.py).
+# Nothing sets "engine" by default, so the default engine stays kokoro.
+_setting_get() {
+    local file="${SPEAK_SETTINGS_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/speak}/settings.json"
+    [[ -f "${file}" ]] || return 0
+    sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([A-Za-z0-9._-]*\)\".*/\1/p" "${file}" 2>/dev/null | head -n 1
+}
+if [[ "${ENGINE_FROM_FLAG}" != true ]]; then
+    _engine_pref="${SPEAK_ENGINE:-}"
+    [[ -n "${_engine_pref}" ]] || _engine_pref="$(_setting_get engine)"
+    case "${_engine_pref}" in
+        "")                       ;;
+        kokoro|piper|deepgram)    ENGINE="${_engine_pref}" ;;
+        *) echo "speak: ignoring unknown configured engine '${_engine_pref}' (use kokoro, piper or deepgram)" >&2 ;;
+    esac
+fi
+
 # --- Set default voice for engine ---
 if [[ -z "${VOICE}" ]]; then
     case "${ENGINE}" in
         kokoro) VOICE="${DEFAULT_KOKORO_VOICE}" ;;
         piper)  VOICE="${DEFAULT_PIPER_VOICE}" ;;
-        *)      echo "speak: unknown engine '${ENGINE}' (use kokoro or piper)" >&2; exit 1 ;;
+        deepgram) VOICE="$(_setting_get deepgram_voice)"; VOICE="${VOICE:-${DEFAULT_DEEPGRAM_VOICE}}" ;;
+        *)      echo "speak: unknown engine '${ENGINE}' (use kokoro, piper or deepgram)" >&2; exit 1 ;;
     esac
 fi
 
@@ -933,6 +956,10 @@ if [[ "${LIST_VOICES}" == true ]]; then
         piper)
             uv run --python 3.14 --with piper-tts --with pathvalidate -- \
                 python3 -m piper.download_voices 2>&1 | grep "^en_"
+            ;;
+        deepgram)
+            echo "Common Deepgram voices (any aura-*/flux-* name is accepted; see https://developers.deepgram.com/docs/tts-models):"
+            python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from speakd.deepgram import KNOWN_VOICES; print("\n".join(KNOWN_VOICES))' "${SCRIPT_DIR}/../lib"
             ;;
     esac
     exit 0
@@ -1161,9 +1188,66 @@ speak_piper() {
     fi
 }
 
+# =============================================================================
+# Deepgram engine (cloud TTS; daemon-backed playback, same queue as Kokoro)
+# =============================================================================
+# Synthesis lives in lib/speakd/deepgram.py. The API key comes from
+# DEEPGRAM_API_KEY or ~/.config/deepgram-voice/env and is never passed on a
+# command line, over the daemon socket, or logged by this script.
+speak_deepgram() {
+    # --save: synthesize and wrap straight into a WAV (loud on every failure).
+    if [[ -n "${SAVE_FILE}" ]]; then
+        if ! printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-deepgram" \
+                --voice "${VOICE}" --speed "${SPEED}" --save "${SAVE_FILE}"; then
+            echo "speak: --save failed — nothing written to ${SAVE_FILE}" >&2
+            exit 1
+        fi
+        if [[ ! -s "${SAVE_FILE}" ]]; then
+            echo "speak: --save failed — wrote nothing to ${SAVE_FILE}" >&2
+            exit 1
+        fi
+        echo "speak: saved to ${SAVE_FILE}" >&2
+        return
+    fi
+
+    # Playback goes through the daemon queue (caller tones, skip/pause, history),
+    # exactly like Kokoro. The daemon validates the voice and key at enqueue time
+    # and rejects loudly. If it can't start, fall back to a direct ffplay pipe.
+    if ! daemon_is_running; then
+        start_daemon || {
+            echo "speak: falling back to direct mode (no daemon)" >&2
+            _require_ffplay
+            printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-deepgram" \
+                --voice "${VOICE}" --speed "${SPEED}" \
+            | ffplay -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -i pipe:0 -loglevel quiet
+            return
+        }
+    fi
+
+    _auto_detect_caller
+    if [[ -z "${SESSION}" ]]; then
+        SESSION="$(_detect_session)"
+    fi
+
+    # speak-enqueue (C) has no engine field, so Deepgram always uses speak-client.
+    local caller_flag=()
+    if [[ -n "${CALLER}" ]]; then
+        caller_flag=(--caller "${CALLER}")
+    fi
+    local _ec=0
+    printf '%s' "${TEXT}" | python3 "${SCRIPT_DIR}/speak-client" \
+        --enqueue --engine deepgram --voice "${VOICE}" --speed "${SPEED}" \
+        --session "${SESSION}" "${caller_flag[@]}" || _ec=$?
+    if [[ ${_ec} -ne 0 ]]; then
+        _log_failure "enqueue_deepgram" "${_ec}" "${TEXT}"
+        exit "${_ec}"
+    fi
+}
+
 # --- Dispatch to engine ---
 case "${ENGINE}" in
     kokoro) speak_kokoro ;;
     piper)  speak_piper ;;
-    *)      echo "speak: unknown engine '${ENGINE}' (use kokoro or piper)" >&2; exit 1 ;;
+    deepgram) speak_deepgram ;;
+    *)      echo "speak: unknown engine '${ENGINE}' (use kokoro, piper or deepgram)" >&2; exit 1 ;;
 esac
