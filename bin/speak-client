@@ -44,6 +44,8 @@ def main():
     parser.add_argument("--voice", default="af_heart")
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--lang", default="en-us")
+    parser.add_argument("--engine", default="kokoro",
+                        help="Synthesis engine for the daemon (kokoro or deepgram)")
     parser.add_argument("--enqueue", action="store_true",
                         help="Enqueue text for playback and return immediately")
     parser.add_argument("--caller", default="",
@@ -147,6 +149,8 @@ def main():
     }
     if args.caller:
         req["caller"] = args.caller
+    if args.engine != "kokoro":
+        req["engine"] = args.engine  # absent == kokoro: wire format unchanged for existing callers
     _send_request(sock, req)
     resp = _read_json_response(sock)
     sock.close()

@@ -4,6 +4,7 @@ import numpy as np
 from kokoro_onnx import Kokoro
 
 from .cache import AudioCache
+from .deepgram import DeepgramTTS
 
 
 class SynthesisEngine:
@@ -12,6 +13,11 @@ class SynthesisEngine:
     def __init__(self, kokoro: Kokoro, cache: AudioCache):
         self.kokoro = kokoro
         self.cache = cache
+        self.deepgram = DeepgramTTS()  # no network until a deepgram request
+
+    def backend_for(self, engine: str | None):
+        """Streaming backend for a request's engine; Kokoro unless 'deepgram'."""
+        return self.deepgram if engine == "deepgram" else self.kokoro
 
     def phonemize_words(self, text: str, lang: str = "en-us") -> list[str]:
         """Phonemize each word of text independently. Returns list of phoneme strings."""

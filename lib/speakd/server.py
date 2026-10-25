@@ -21,6 +21,7 @@ from .config import (
     load_settings,
     save_setting,
 )
+from .deepgram import validate_enqueue_request
 from .kokoro_patch import apply_patch
 from .playback import PlaybackQueue
 from .protocol import send_json
@@ -88,6 +89,13 @@ class SpeakDaemon:
 
             # --- Enqueue dispatch (fire-and-forget) ---
             if request.get("enqueue"):
+                # Reject a bad engine/voice/missing Deepgram key up front so the
+                # caller sees a loud failure instead of silently dropped speech.
+                engine_error = validate_enqueue_request(request)
+                if engine_error:
+                    send_json(writer, {"ok": False, "error": engine_error})
+                    await writer.drain()
+                    return
                 priority = request.get("priority", False)
                 position = await self.playback_queue.enqueue(request, priority=priority)
                 send_json(writer, {"ok": True, "position": position})

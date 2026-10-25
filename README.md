@@ -1,6 +1,6 @@
 # speak
 
-Local text-to-speech CLI powered by [Kokoro](https://github.com/hexgrad/kokoro) (with Piper as a fallback engine). A background daemon keeps the model loaded so subsequent calls are fast.
+Local text-to-speech CLI powered by [Kokoro](https://github.com/hexgrad/kokoro) (with Piper as a fallback engine, and [Deepgram](https://developers.deepgram.com/docs/text-to-speech) cloud TTS as an optional alternate engine). A background daemon keeps the model loaded so subsequent calls are fast.
 
 ## Quick start
 
@@ -24,8 +24,8 @@ The daemon starts automatically on first use. It shuts down after 5 minutes of i
 
 | Flag | Description |
 |------|-------------|
-| `--engine ENGINE` | TTS engine: `kokoro` (default) or `piper` |
-| `--voice NAME` | Voice name (default: `af_heart`) |
+| `--engine ENGINE` | TTS engine: `kokoro` (default), `piper`, or `deepgram` (see [Engines](#engines)) |
+| `--voice NAME` | Voice name (default: `af_heart` for kokoro, `en_US-ryan-high` for piper, `aura-2-thalia-en` for deepgram) |
 | `--speed FLOAT` | Speech speed (default: `1.26`) |
 | `--save FILE` | Save to WAV file instead of playing |
 | `--voices` | List available voices |
@@ -38,6 +38,59 @@ The daemon starts automatically on first use. It shuts down after 5 minutes of i
 | `--replay` | Replay the last queued item |
 | `--stats` | Show daemon stats (uptime, cache, queue totals) |
 | `--caller NAME` | Caller identity (plays a unique tone per caller) |
+
+## Engines
+
+| Engine | Where it runs | Default voice | Playback | Notes |
+|--------|---------------|---------------|----------|-------|
+| `kokoro` (default) | local, in the daemon | `af_heart` | daemon queue | |
+| `piper` | local, one process per call | `en_US-ryan-high` | `ffplay` pipe | |
+| `deepgram` | Deepgram cloud API | `aura-2-thalia-en` | daemon queue (same as kokoro) | needs an API key; sends your text to Deepgram |
+
+Engine precedence: `--engine` flag, then the `SPEAK_ENGINE` env var, then
+`"engine"` in the daemon settings file (`~/.local/share/speak/settings.json`),
+then `kokoro`. Nothing sets the setting by default, so the default stays Kokoro.
+
+### Deepgram engine
+
+```bash
+speak --engine deepgram "Hello from Deepgram"
+speak --engine deepgram --voice aura-2-andromeda-en --speed 1.1 "Another voice"
+speak --engine deepgram --save out.wav "Saved to a WAV file"
+speak --engine deepgram --voices        # common voices (any aura-*/flux-* name works)
+```
+
+`--voice`, `--speed`, `--save`, `--caller` and the queue commands (`--skip`,
+`--pause`, `--replay`, ...) work the same as with Kokoro. Playback goes through
+the daemon's queue and audio stream; Deepgram voices bypass the Kokoro
+per-caller voice pool.
+
+**API key.** Not shipped or committed; configure one of:
+
+1. `DEEPGRAM_API_KEY` in the environment, or
+2. `DEEPGRAM_API_KEY=<key>` in `~/.config/deepgram-voice/env` (plain `KEY=VALUE`
+   lines, `export` prefix and quotes optional; the file is parsed, not sourced).
+   `chmod 600` it.
+
+The environment variable wins. The daemon (launchd) does not inherit your shell
+environment, so use the config file if you run the daemon under launchd. With
+no key, `speak --engine deepgram ...` fails loudly (non-zero exit) instead of
+staying silent. The key is only sent in the `Authorization: Token <key>` header
+to `api.deepgram.com` and is never logged, echoed, or written to state/history.
+
+**Request.** `POST https://api.deepgram.com/v1/speak?model=<voice>&encoding=linear16&sample_rate=24000&container=none&speed=<n>`
+with body `{"text": "..."}`; raw 24 kHz PCM comes back and feeds the same
+playback/save path as Kokoro. Voice names must match `^(aura|flux)(-[a-z0-9]+)+$`
+and are validated before use. Long clauses are split to stay under Deepgram's
+per-request character limit.
+
+Optional configuration:
+
+| Setting | Env var | Settings key (`settings.json`) | Default |
+|---------|---------|-------------------------------|---------|
+| API version (`v1`/`v2`) | `SPEAK_DEEPGRAM_API_VERSION` | `deepgram_api_version` | `v1` |
+| Default voice | | `deepgram_voice` | `aura-2-thalia-en` |
+| Stop sending `speed` | `DEEPGRAM_SPEED=off` | | send it (clamped 0.7–1.5) |
 
 ## Playback modes
 
@@ -58,7 +111,8 @@ echo "summary of results" | speak
 > The legacy synchronous `--stream` mode (blocking playback piped straight to
 > `ffplay`) was retired. `--save` still writes a WAV directly, and the
 > daemon-less `speak_kokoro_direct` fallback + the piper engine still use
-> `ffplay`.
+> `ffplay`. (The Deepgram engine uses the daemon queue like Kokoro; its `--save`
+> writes a WAV directly, and it has the same daemon-less `ffplay` fallback.)
 
 Manage the queue:
 
@@ -278,6 +332,8 @@ Length-prefixed messages over Unix socket. Each message is `[4-byte big-endian l
 ```
 Response: `{"ok": true, "position": 1}` (length-prefixed + zero terminator).
 
+An optional `"engine": "deepgram"` field (with an `aura-*` `voice`) selects the Deepgram engine; absent means Kokoro. A bad engine/voice or a missing Deepgram API key is rejected at enqueue with `{"ok": false, "error": ...}`.
+
 **Command request:**
 ```json
 {"command": "queue_status"}
@@ -287,3 +343,13 @@ Response: `{"ok": true, "position": 1}` (length-prefixed + zero terminator).
 {"command": "stats"}
 ```
 Response: JSON result (length-prefixed + zero terminator).
+
+## Tests
+
+```bash
+python3 -m unittest discover -s test -v
+```
+
+Covers the Deepgram engine (voice/API-key/URL validation, request shape,
+`--engine`/settings wiring in `bin/speak`, daemon render path) with the network
+stubbed; no API key or live call is needed.

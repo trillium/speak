@@ -170,7 +170,7 @@ async def _play_sys_clip(
     return True
 
 
-async def prefetch_first_chunk(synth, text, voice_name, speed, lang):
+async def prefetch_first_chunk(synth, text, voice_name, speed, lang, engine=None):
     """Synthesize the first clause of the first text segment concurrently with tone playback.
 
     Splits text at sys sentinels first. Prefetches only the first clause of the
@@ -207,7 +207,7 @@ async def prefetch_first_chunk(synth, text, voice_name, speed, lang):
         )
 
     first_chunks = []
-    async for audio, sr in synth.kokoro.create_stream(
+    async for audio, sr in synth.backend_for(engine).create_stream(
         first_clause, voice_name, speed, lang, trim=False
     ):
         first_chunks.append((audio, sr))
@@ -254,6 +254,7 @@ async def render_speech(
     lang = request.get("lang", "en-us")
     qid = request.get("_queue_id", "?")
     caller = request.get("caller", "")
+    engine = request.get("engine")
 
     # Voice and gain already resolved by playback.py via VoicePool
     voice_name = request.get("_resolved_voice", voice_name)
@@ -316,7 +317,7 @@ async def render_speech(
 
         # Collect all audio chunks from this clause into one array
         clause_audio = []
-        async for audio, sr in synth.kokoro.create_stream(
+        async for audio, sr in synth.backend_for(engine).create_stream(
             clause, voice_name, speed, lang, trim=False
         ):
             if skip_flag_fn():
